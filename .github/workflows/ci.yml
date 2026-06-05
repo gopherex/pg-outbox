@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_call: # reused by release.yml to gate releases on a green build
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Discover every Go module so jobs auto-adapt when a module is added — no
+  # hardcoded list. '.' is the library; test/integration is the Docker module.
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.list.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: list
+        run: |
+          mods=$(find . -name go.mod -not -path '*/vendor/*' -printf '%h\n' \
+            | sort | jq -R . | jq -cs .)
+          echo "modules=$mods" >> "$GITHUB_OUTPUT"
+          echo "$mods"
+
+  test:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.discover.outputs.modules) }}
+    name: test (${{ matrix.module }})
+    env:
+      # Build each module in isolation via its own go.mod (+ replace directive),
+      # exactly as an external consumer would — validates module independence.
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: gofmt
+        working-directory: ${{ matrix.module }}
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt needed:"; echo "$out"; exit 1
+          fi
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+      - name: go build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      # Unit tests run for the library. The integration module needs a Docker
+      # daemon (testcontainers) and runs in the dedicated job below; `go vet`
+      # above already type-checks its test files.
+      - name: go test -race
+        if: matrix.module != 'test/integration'
+        working-directory: ${{ matrix.module }}
+        run: go test -race ./...
+
+  # Black-box integration tests against a real Postgres (testcontainers). Lives
+  # in its own module so testcontainers never enters the library's go.mod.
+  integration:
+    runs-on: ubuntu-latest # Docker preinstalled
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache-dependency-path: test/integration/go.sum
+      - name: go test
+        working-directory: test/integration
+        run: go test ./...
