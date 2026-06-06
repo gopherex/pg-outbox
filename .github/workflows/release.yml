@@ -1,11 +1,12 @@
 name: Release
 
-# Root module tags only (vX.Y.Z). The test/integration module is internal and
-# never tagged.
+# Root tags use vX.Y.Z. Contrib module tags use path-prefixed tags such as
+# contrib/publishers/nats/vX.Y.Z.
 on:
   push:
     tags:
       - "v*"
+      - "contrib/**/v*"
 
 permissions:
   contents: read

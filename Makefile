@@ -10,22 +10,24 @@ MAX_MAJOR := 1
 .PHONY: help test test-integration tidy lint release
 
 help:
-	@echo "make test             - gofmt/vet/build/test the library module (no Docker)"
+	@echo "make test             - gofmt/vet/build/test every non-integration module"
 	@echo "make test-integration - run the nested integration module (testcontainers; Docker required)"
 	@echo "make lint             - gofmt check + go vet across every module"
 	@echo "make tidy             - go mod tidy in every module"
-	@echo "make release          - interactive root-module release (tag vX.Y.Z + push)"
+	@echo "make release          - interactive multi-module release (tag root + every contrib)"
 
-# Every go.mod in the repo. '.' is the published library; test/integration is a
-# Docker-only test module deliberately kept out of the published dependency graph.
+# Every go.mod in the repo. '.' is the root module; contrib modules are tagged
+# with their path prefix; test/integration is internal and never tagged.
 MODDIRS = $(shell find . -name go.mod -not -path './.git/*' -printf '%h\n' | sed 's#^\./##' | sort)
 
-# Fast, hermetic checks for the published library — no Docker, like CI.
+# Fast, hermetic checks for every non-integration module — no Docker, like CI.
 test:
-	@out=$$(gofmt -l .); [ -z "$$out" ] || { echo "✗ gofmt needed:"; echo "$$out"; exit 1; }
-	GOWORK=off go build ./...
-	GOWORK=off go vet ./...
-	GOWORK=off go test -race ./...
+	@for d in $(MODDIRS); do
+	  [ "$$d" = "test/integration" ] && continue
+	  echo "== $$d =="
+	  out=$$(cd "$$d" && gofmt -l .); [ -z "$$out" ] || { echo "✗ gofmt needed:"; echo "$$out"; exit 1; }
+	  ( cd "$$d" && GOWORK=off go build ./... && GOWORK=off go vet ./... && GOWORK=off go test -race ./... )
+	done
 
 # Black-box integration suite in the nested module (spins up Postgres via
 # testcontainers). Requires a running Docker daemon.
@@ -43,8 +45,9 @@ lint:
 tidy:
 	@for d in $(MODDIRS); do ( cd "$$d" && go mod tidy ); done
 
-# Single published module: tag the root with vX.Y.Z and push. The
-# test/integration module is internal (replace directive) and is never tagged.
+# Multi-module release: tag the root with vX.Y.Z and every contrib module with
+# its path prefix (for example contrib/publishers/nats/vX.Y.Z). The
+# test/integration module is internal and is never tagged.
 release:
 	@set -euo pipefail
 	cd "$$(git rev-parse --show-toplevel)"
@@ -55,6 +58,7 @@ release:
 	  exit 1
 	fi
 
+	mods="$$(for d in $(MODDIRS); do [ "$$d" = "test/integration" ] && continue; echo "$$d"; done)"
 	cur="$$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
 	cur="$${cur:-0.0.0}"
 	head="$$(git rev-parse --short HEAD)"
@@ -65,19 +69,29 @@ release:
 	echo "  3) cancel"
 	read -r -p "> " action
 
+	tags_for() { # $1 = version (without v); prints one tag per released module
+	  local v="$$1" d
+	  for d in $$mods; do
+	    if [ "$$d" = "." ]; then echo "v$$v"; else echo "$$d/v$$v"; fi
+	  done
+	}
+
 	case "$$action" in
 	1)
 	  if [ "$$cur" = "0.0.0" ] && ! git tag -l 'v0.0.0' | grep -q .; then
 	    echo "✗ No release tags to recreate."; exit 1
 	  fi
+	  mapfile -t TAGS < <(tags_for "$$cur")
 	  echo
-	  echo "Will DELETE and recreate v$$cur on $$head, then force-push."
+	  echo "Will DELETE and recreate $${#TAGS[@]} tags of v$$cur on $$head, then force-push."
 	  read -r -p "Type 'yes' to proceed: " ok
 	  [ "$$ok" = "yes" ] || { echo "Aborted."; exit 0; }
-	  git tag -d "v$$cur" 2>/dev/null || true
-	  git push origin ":refs/tags/v$$cur" 2>/dev/null || true
-	  git tag -a "v$$cur" -m "v$$cur"
-	  git push origin --force "v$$cur"
+	  for t in "$${TAGS[@]}"; do
+	    git tag -d "$$t" 2>/dev/null || true
+	    git push origin ":refs/tags/$$t" 2>/dev/null || true
+	  done
+	  for t in "$${TAGS[@]}"; do git tag -a "$$t" -m "$$t"; done
+	  git push origin --force "$${TAGS[@]}"
 	  echo "✓ Recreated v$$cur on $$head."
 	  ;;
 	2)
@@ -99,14 +113,24 @@ release:
 	    exit 1
 	  fi
 	  new="$$MA.$$MI.$$PA"
+	  mapfile -t TAGS < <(tags_for "$$new")
 	  echo
-	  echo "Release v$$new — create tag v$$new and push."
+	  echo "Release v$$new — will:"
+	  echo "  - set 'require $(ROOT_MODULE) v$$new' in every released nested go.mod"
+	  echo "  - commit 'release v$$new'"
+	  echo "  - create $${#TAGS[@]} tags and push"
 	  read -r -p "Type 'yes' to proceed: " ok
 	  [ "$$ok" = "yes" ] || { echo "Aborted."; exit 0; }
-	  git tag -a "v$$new" -m "v$$new"
+	  for d in $$mods; do
+	    [ "$$d" = "." ] && continue
+	    ( cd "$$d" && go mod edit -require=$(ROOT_MODULE)@v$$new )
+	  done
+	  git add -A
+	  git diff --cached --quiet || git commit -m "release v$$new"
+	  for t in "$${TAGS[@]}"; do git tag -a "$$t" -m "$$t"; done
 	  git push origin HEAD
-	  git push origin "v$$new"
-	  echo "✓ Released v$$new."
+	  git push origin "$${TAGS[@]}"
+	  echo "✓ Released v$$new ($${#TAGS[@]} modules)."
 	  ;;
 	*)
 	  echo "Cancelled."

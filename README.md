@@ -56,7 +56,22 @@ err = tx.DoSerializable(ctx, mgr, func(ctx context.Context) error {
 go ob.Run(ctx) // blocks until ctx is cancelled, then drains and returns
 ```
 
-Implement `outbox.Publisher` for your transport:
+Use a contrib publisher:
+
+```go
+import outboxnats "github.com/gopherex/pg-outbox/contrib/publishers/nats"
+
+pub := outboxnats.New(natsConn)
+ob, err := outbox.New(pool, enq, pub)
+```
+
+Available publisher contrib modules:
+
+- `github.com/gopherex/pg-outbox/contrib/publishers/nats`
+- `github.com/gopherex/pg-outbox/contrib/publishers/kafka`
+- `github.com/gopherex/pg-outbox/contrib/publishers/valkey`
+
+Or implement `outbox.Publisher` for your own transport:
 
 ```go
 type Publisher interface {
@@ -123,10 +138,11 @@ outbox.WithRetryBackoff(backoff.FromNexter(func() backoff.Nexter { ... }))
 
 ## Package layout
 
-The root package `outbox` is the only public surface (facade + re-exports). The
+The root package `outbox` is the core public surface (facade + re-exports). The
 implementation lives in subpackages: `message`, `port` (Publisher/Codec/Hooks/
 Executor), `config`, `backoff`, `migrations`, `engine` (store/relay/cleaner).
-The published module depends only on `pgx`; the standard library covers logging.
+Concrete publishers live in nested `contrib/publishers/*` modules so Kafka,
+NATS and Valkey dependencies never enter the core module's `go.mod`.
 
 ## Semantics
 
@@ -149,16 +165,15 @@ The published module depends only on `pgx`; the standard library covers logging.
 - `attempts` increments at claim time, so a crash mid-publish counts as an
   attempt (poison-message protection).
 - The table name is fixed (`outbox_messages`); only the schema is configurable.
-- Codecs (JSON/proto) and concrete publishers (Kafka/NATS/…) are out of scope —
-  bring your own.
+- Codecs (JSON/proto) are out of scope — bring your own.
 
 ## Tests
 
 ```bash
-go test -race ./...                       # pure-logic unit tests, no DB
+make test                                 # root + contrib module tests, no DB
 cd test/integration && go test ./...      # black-box integration (testcontainers Postgres, Docker required)
 ```
 
-Integration tests live in a **separate nested module** (`test/integration`) so
-the heavy testcontainers / docker dependency tree never enters this module's
-`go.mod`. The published library stays a single `pgx` dependency.
+Contrib publishers and integration tests live in **separate nested modules** so
+their dependency trees never enter the core module's `go.mod`. The core library
+stays a single `pgx` dependency.
