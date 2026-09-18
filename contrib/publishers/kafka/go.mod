@@ -3,7 +3,7 @@ module github.com/gopherex/pg-outbox/contrib/publishers/kafka
 go 1.25.0
 
 require (
-	github.com/gopherex/pg-outbox v0.0.0
+	github.com/gopherex/pg-outbox v1.1.0
 	github.com/segmentio/kafka-go v0.4.49
 )
 
