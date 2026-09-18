@@ -7,6 +7,9 @@ ROOT_MODULE := github.com/gopherex/pg-outbox
 # which we don't support yet — keep releases on v0/v1.
 MAX_MAJOR := 1
 
+# Keep every target isolated from parent Go workspaces.
+export GOWORK := off
+
 .PHONY: help test test-integration tidy lint release
 
 help:
@@ -33,7 +36,7 @@ test:
 # testcontainers). Requires a running Docker daemon.
 test-integration:
 	@cd test/integration
-	go test ./...
+	go test -race -count=1 ./...
 
 lint:
 	@for d in $(MODDIRS); do
@@ -117,7 +120,7 @@ release:
 	  echo
 	  echo "Release v$$new — will:"
 	  echo "  - set 'require $(ROOT_MODULE) v$$new' in every released nested go.mod"
-	  echo "  - commit 'release v$$new'"
+	  echo "  - commit 'chore(release): release v$$new'"
 	  echo "  - create $${#TAGS[@]} tags and push"
 	  read -r -p "Type 'yes' to proceed: " ok
 	  [ "$$ok" = "yes" ] || { echo "Aborted."; exit 0; }
@@ -126,10 +129,10 @@ release:
 	    ( cd "$$d" && go mod edit -require=$(ROOT_MODULE)@v$$new )
 	  done
 	  git add -A
-	  git diff --cached --quiet || git commit -m "release v$$new"
+	  git diff --cached --quiet || git commit -m "chore(release): release v$$new"
 	  for t in "$${TAGS[@]}"; do git tag -a "$$t" -m "$$t"; done
 	  git push origin HEAD
-	  git push origin "$${TAGS[@]}"
+	  for t in "$${TAGS[@]}"; do git push origin "$$t"; done
 	  echo "✓ Released v$$new ($${#TAGS[@]} modules)."
 	  ;;
 	*)

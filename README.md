@@ -136,6 +136,93 @@ outbox.WithRetryBackoff(backoff.FromNextBackOff(func() backoff.NextBackOffer {
 outbox.WithRetryBackoff(backoff.FromNexter(func() backoff.Nexter { ... }))
 ```
 
+## Delivery control
+
+Existing publishers remain compatible: `nil` means published; an ordinary
+error retries the entire batch with the configured backoff and attempt limit.
+A publisher can return these wrapped outcomes (recognized through `errors.As`):
+
+```go
+return outbox.Permanent(err)                  // dead immediately
+return outbox.RetryAfter(err, 2*time.Minute)   // minimum delay; attempt limit still applies
+return outbox.Discard(reason)                 // terminal, without publication or dead-letter
+```
+
+These outcomes apply to **every message in the batch**. Use `WithBatchSize(1)`
+for independent outcomes and `WithConcurrency` for parallelism. RetryAfter
+uses the greater of its delay and the configured backoff; zero/negative delays
+never reduce backoff. Wrappers preserve `errors.Is` / `errors.As`. Do not mix
+outcome markers; if nested/joined, Permanent takes precedence over Discard,
+then RetryAfter. Nil causes still produce the requested outcome.
+
+The library treats payloads as opaque bytes. Application policy, deadlines,
+provider error classification, recipient preferences, and authorization belong
+in the caller/publisher. Store only sanitized errors: error text is persisted
+in `last_error` and passed to observability hooks.
+
+### Claims, cancellation, and completion
+
+Every claim gets a fresh `Message.LeaseToken`. Completion and renewal require
+that token **and an unexpired processing lease**. A stale worker cannot finish,
+retry, or dead-letter a later attempt, even with the same instance ID or after
+an operator resets attempts. `ErrLeaseLost` is observable through the relay's
+error logger; stale completions do not emit outcome hooks.
+
+While Publish runs, the relay renews the batch every third of LeaseDuration.
+A renewal failure cancels the publisher context and leaves recovery to lease
+expiry. Publishers must honor cancellation and configure transport timeouts;
+`WithPublishTimeout` optionally bounds the context for each Publish call
+(disabled by default). Cancellation cannot undo an external side effect, and
+an adapter that ignores context cannot be forcibly stopped. Delivery remains
+at-least-once, including when publication succeeds but recording it fails.
+
+Hooks run after database transitions and receive the resulting row snapshots.
+They are best-effort observations, not a transaction or a durable event stream.
+An optional `DiscardHooks` interface adds `OnDiscarded(ctx, msgs, reason)`;
+existing Hooks implementations do not need to change. Discards never call
+OnPublished or OnDead. Process termination between commit and a hook can lose
+that observation.
+
+### Terminal data and replay
+
+```go
+outbox.WithClearPayloadOnComplete(true) // empty payload + headers on published/discarded
+outbox.WithRetention(24*time.Hour)       // delete published rows
+outbox.WithDeadRetention(7*24*time.Hour) // delete dead rows
+outbox.WithDiscardRetention(time.Hour)  // delete discarded rows
+outbox.WithCleanupInterval(time.Minute)
+```
+
+All data-clearing/deletion policies are **opt-in**. Payload and headers are
+cleared atomically with the successful/discarded transition; dead rows retain
+them for investigation and replay. Hooks see the cleared fields when enabled.
+Other columns, including topic, partition key, and last_error, are not scrubbed.
+SQL deletion/clearing does not erase historical WAL, backups, or caller logs.
+
+Dead/discarded retention starts at `finished_at`, published retention at
+`published_at`. Cleanup locks selected rows and skips locks, preventing it
+from deleting a concurrently requeued job. Pending/processing rows are never
+removed by the cleaner.
+
+`ob.Requeue(ctx, id)` returns `(changed bool, err error)`. Only dead rows qualify;
+it resets attempts and terminal/lease state and emits a transactional wake-up.
+It uses the **enqueue executor**, so the caller can validate application policy
+and requeue in the same transaction. It preserves ID, creation time, and data;
+the next attempt receives a new lease token. Replaying a job can repeat an
+external side effect. The caller owns permission and eligibility checks.
+
+### Upgrade from v1.0
+
+Apply `0002_delivery_control.sql` before using the new relay. It adds claim
+tokens, terminal timestamps, and the generic `discarded` state. Existing data
+is preserved; historical dead rows begin their retention window at migration
+time because their original terminal time is unknown. New retention settings
+remain disabled unless configured.
+
+Stop/drain old relays before starting new ones. Old binaries do not fence their
+completion writes; do not mix old and new relays against the same queue.
+The Publisher, Hooks, and Executor interfaces remain source-compatible.
+
 ## Package layout
 
 The root package `outbox` is the core public surface (facade + re-exports). The
@@ -155,8 +242,8 @@ NATS and Valkey dependencies never enter the core module's `go.mod`.
   rescheduled with backoff; after `WithMaxAttempts` it becomes `dead` and stays
   in the table for inspection.
 - **Ordering.** Best-effort by `created_at`. `WithOrdered(true)` enforces strict
-  per-`PartitionKey` ordering; note a `dead` row then blocks its key until an
-  operator resolves it.
+  per-`PartitionKey` ordering (creation time, then ID); a `dead` row blocks its
+  key until resolved or removed. Published/discarded rows do not block it.
 - **Latency.** A trigger fires `NOTIFY`; the relay wakes near-instantly and
   falls back to polling every `WithPollInterval`.
 

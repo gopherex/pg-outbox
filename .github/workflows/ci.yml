@@ -64,7 +64,7 @@ jobs:
       # daemon (testcontainers) and runs in the dedicated job below; `go vet`
       # above already type-checks its test files.
       - name: go test -race
-        if: matrix.module != 'test/integration'
+        if: matrix.module != './test/integration' && matrix.module != 'test/integration'
         working-directory: ${{ matrix.module }}
         run: go test -race ./...
 
@@ -80,4 +80,4 @@ jobs:
           cache-dependency-path: test/integration/go.sum
       - name: go test
         working-directory: test/integration
-        run: go test ./...
+        run: GOWORK=off go test -race -count=1 ./...

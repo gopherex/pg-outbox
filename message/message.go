@@ -26,6 +26,7 @@ const (
 	StatusProcessing Status = "processing"
 	StatusPublished  Status = "published"
 	StatusDead       Status = "dead"
+	StatusDiscarded  Status = "discarded"
 )
 
 // Message is a single outbox row.
@@ -46,12 +47,14 @@ type Message struct {
 	// Populated when read back by the relay.
 	Status        Status
 	Attempts      int
+	LeaseToken    string // unique per claim, including reclaims by the same instance
 	LockedBy      string
 	LockedUntil   *time.Time
 	NextAttemptAt time.Time
 	LastError     string
 	CreatedAt     time.Time
 	PublishedAt   *time.Time
+	FinishedAt    *time.Time // published, discarded, or dead
 }
 
 // Validate reports whether the message is well-formed for enqueue.

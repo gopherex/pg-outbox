@@ -41,7 +41,11 @@ type (
 	// Codec marshals a value to bytes for storage and back.
 	Codec = port.Codec
 	// Hooks observes relay activity.
-	Hooks = port.Hooks
+	Hooks           = port.Hooks
+	DiscardHooks    = port.DiscardHooks
+	PermanentError  = port.PermanentError
+	RetryAfterError = port.RetryAfterError
+	DiscardError    = port.DiscardError
 	// NoopHooks is the default no-op Hooks implementation.
 	NoopHooks = port.NoopHooks
 	// Executor is the pluggable pgx query surface (Exec, Query, QueryRow).
@@ -67,28 +71,41 @@ const (
 	StatusProcessing = message.StatusProcessing
 	StatusPublished  = message.StatusPublished
 	StatusDead       = message.StatusDead
+	StatusDiscarded  = message.StatusDiscarded
 )
 
 // ---- Re-exported options ----------------------------------------------
 
 var (
-	WithConfig          = config.WithConfig
-	WithInstanceID      = config.WithInstanceID
-	WithSchema          = config.WithSchema
-	WithPollInterval    = config.WithPollInterval
-	WithBatchSize       = config.WithBatchSize
-	WithLeaseDuration   = config.WithLeaseDuration
-	WithConcurrency     = config.WithConcurrency
-	WithMaxAttempts     = config.WithMaxAttempts
-	WithRetryBackoff    = config.WithRetryBackoff
-	WithRetention       = config.WithRetention
-	WithCleanupInterval = config.WithCleanupInterval
-	WithOrdered         = config.WithOrdered
-	WithoutNotify       = config.WithoutNotify
-	WithListenPool      = config.WithListenPool
-	WithHooks           = config.WithHooks
-	WithCodec           = config.WithCodec
-	WithLogger          = config.WithLogger
+	WithConfig                 = config.WithConfig
+	WithInstanceID             = config.WithInstanceID
+	WithSchema                 = config.WithSchema
+	WithPollInterval           = config.WithPollInterval
+	WithBatchSize              = config.WithBatchSize
+	WithLeaseDuration          = config.WithLeaseDuration
+	WithConcurrency            = config.WithConcurrency
+	WithMaxAttempts            = config.WithMaxAttempts
+	WithRetryBackoff           = config.WithRetryBackoff
+	WithRetention              = config.WithRetention
+	WithDeadRetention          = config.WithDeadRetention
+	WithDiscardRetention       = config.WithDiscardRetention
+	WithClearPayloadOnComplete = config.WithClearPayloadOnComplete
+	WithPublishTimeout         = config.WithPublishTimeout
+	WithCleanupInterval        = config.WithCleanupInterval
+	WithOrdered                = config.WithOrdered
+	WithoutNotify              = config.WithoutNotify
+	WithListenPool             = config.WithListenPool
+	WithHooks                  = config.WithHooks
+	WithCodec                  = config.WithCodec
+	WithLogger                 = config.WithLogger
+)
+
+// Publisher outcome controls apply to the whole batch and preserve wrapped errors.
+var (
+	Permanent    = port.Permanent
+	RetryAfter   = port.RetryAfter
+	Discard      = port.Discard
+	ErrLeaseLost = port.ErrLeaseLost
 )
 
 // ---- Re-exported backoff ----------------------------------------------
@@ -106,7 +123,7 @@ var DefaultBackoff = backoff.Default
 // the migration connection to install into a non-default schema.
 func MigrationsFS() embed.FS { return migrations.FS() }
 
-// Migrations returns the contents of every *.up.sql file, ordered by filename,
+// Migrations returns the contents of every forward-only *.sql file, ordered by filename,
 // ready to pass to Exec for callers applying migrations without a tool.
 func Migrations() []string { return migrations.Up() }
 
@@ -211,6 +228,14 @@ func (o *Outbox) EnqueueValue(ctx context.Context, topic, partitionKey, msgType 
 		Payload:      payload,
 		ContentType:  ct,
 	})
+}
+
+// Requeue atomically returns a dead row to pending and resets its attempts.
+// It uses the enqueue executor, so authorization and application checks can be
+// performed in the same caller transaction. False means no dead row matched.
+// IDs and creation time are preserved; the next claim gets a fresh lease token.
+func (o *Outbox) Requeue(ctx context.Context, id string) (bool, error) {
+	return o.store.Requeue(ctx, id)
 }
 
 // Run starts the relay and cleaner and blocks until ctx is cancelled. The lease

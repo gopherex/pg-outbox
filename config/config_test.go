@@ -126,3 +126,18 @@ func TestValidSchema(t *testing.T) {
 		}
 	}
 }
+
+func TestDeliveryControls(t *testing.T) {
+	s := Resolve(WithConfig(Config{
+		DeadRetention: time.Hour, DiscardRetention: time.Minute,
+		ClearPayloadOnComplete: true, PublishTimeout: time.Second,
+	}), WithDeadRetention(2*time.Hour))
+	if s.DeadRetention != 2*time.Hour || s.DiscardRetention != time.Minute ||
+		!s.ClearPayloadOnComplete || s.PublishTimeout != time.Second {
+		t.Fatalf("delivery controls not applied: %+v", s)
+	}
+	d := Default()
+	if d.DeadRetention != 0 || d.DiscardRetention != 0 || d.ClearPayloadOnComplete || d.PublishTimeout != 0 {
+		t.Fatalf("existing users must opt in: %+v", d)
+	}
+}

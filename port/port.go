@@ -17,7 +17,9 @@ import (
 // A non-nil error fails the whole batch: every message is retried (or
 // dead-lettered) per the relay's policy. Because delivery is at-least-once and a
 // partial-success batch is re-published in full, consumers must deduplicate. For
-// strict per-message isolation, run the relay with batch size 1.
+// strict per-message isolation, run the relay with batch size 1. Permanent,
+// RetryAfter and Discard control the outcome of the entire batch. Publish must
+// honor context cancellation; claims are renewed while it runs.
 type Publisher interface {
 	Publish(ctx context.Context, msgs []message.Message) error
 }
@@ -36,6 +38,12 @@ type Hooks interface {
 	OnFailed(ctx context.Context, msg message.Message, err error)
 	OnDead(ctx context.Context, msg message.Message)
 	OnCleanup(ctx context.Context, deleted int)
+}
+
+// DiscardHooks is an optional extension of Hooks. It observes a committed
+// discard; applications can implement it without changing existing Hooks.
+type DiscardHooks interface {
+	OnDiscarded(ctx context.Context, msgs []message.Message, reason error)
 }
 
 // NoopHooks is the default Hooks implementation; every method is a no-op.

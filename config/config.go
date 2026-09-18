@@ -23,22 +23,26 @@ var ErrInvalidSchema = errors.New("outbox: invalid schema identifier")
 // Settings is the resolved runtime configuration the engine reads. Build it with
 // Default plus Options, or from a declarative Config via WithConfig.
 type Settings struct {
-	InstanceID      string
-	Schema          string
-	PollInterval    time.Duration
-	BatchSize       int
-	LeaseDuration   time.Duration
-	Concurrency     int
-	MaxAttempts     int
-	Backoff         backoff.Backoff
-	Retention       time.Duration
-	CleanupInterval time.Duration
-	Ordered         bool
-	Notify          bool
-	ListenPool      *pgxpool.Pool
-	Hooks           port.Hooks
-	Codec           port.Codec
-	Logger          *slog.Logger
+	InstanceID             string
+	Schema                 string
+	PollInterval           time.Duration
+	BatchSize              int
+	LeaseDuration          time.Duration
+	Concurrency            int
+	MaxAttempts            int
+	Backoff                backoff.Backoff
+	Retention              time.Duration
+	DeadRetention          time.Duration
+	DiscardRetention       time.Duration
+	ClearPayloadOnComplete bool
+	PublishTimeout         time.Duration
+	CleanupInterval        time.Duration
+	Ordered                bool
+	Notify                 bool
+	ListenPool             *pgxpool.Pool
+	Hooks                  port.Hooks
+	Codec                  port.Codec
+	Logger                 *slog.Logger
 }
 
 // Default returns the baseline settings before any Option is applied.
@@ -118,15 +122,19 @@ func generateInstanceID() string {
 // functional options; the logger is injected separately via WithLogger because
 // it is a runtime dependency, not configuration data.
 type Config struct {
-	Schema          string        `mapstructure:"schema" default:"public"`
-	PollInterval    time.Duration `mapstructure:"poll_interval" default:"1s"`
-	BatchSize       int           `mapstructure:"batch_size" default:"100"`
-	LeaseDuration   time.Duration `mapstructure:"lease_duration" default:"30s"`
-	Concurrency     int           `mapstructure:"concurrency" default:"1"`
-	MaxAttempts     int           `mapstructure:"max_attempts" default:"10"`
-	Retention       time.Duration `mapstructure:"retention"`
-	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
-	Ordered         bool          `mapstructure:"ordered"`
+	Schema                 string        `mapstructure:"schema" default:"public"`
+	PollInterval           time.Duration `mapstructure:"poll_interval" default:"1s"`
+	BatchSize              int           `mapstructure:"batch_size" default:"100"`
+	LeaseDuration          time.Duration `mapstructure:"lease_duration" default:"30s"`
+	Concurrency            int           `mapstructure:"concurrency" default:"1"`
+	MaxAttempts            int           `mapstructure:"max_attempts" default:"10"`
+	Retention              time.Duration `mapstructure:"retention"`
+	DeadRetention          time.Duration `mapstructure:"dead_retention"`
+	DiscardRetention       time.Duration `mapstructure:"discard_retention"`
+	ClearPayloadOnComplete bool          `mapstructure:"clear_payload_on_complete"`
+	PublishTimeout         time.Duration `mapstructure:"publish_timeout"`
+	CleanupInterval        time.Duration `mapstructure:"cleanup_interval"`
+	Ordered                bool          `mapstructure:"ordered"`
 	// DisableNotify turns LISTEN/NOTIFY off (poll-only). The zero value keeps
 	// NOTIFY enabled, so a hand-built Config does not silently disable it.
 	DisableNotify bool `mapstructure:"disable_notify"`
@@ -146,6 +154,10 @@ func WithConfig(c Config) Option {
 		s.Concurrency = c.Concurrency
 		s.MaxAttempts = c.MaxAttempts
 		s.Retention = c.Retention
+		s.DeadRetention = c.DeadRetention
+		s.DiscardRetention = c.DiscardRetention
+		s.ClearPayloadOnComplete = c.ClearPayloadOnComplete
+		s.PublishTimeout = c.PublishTimeout
 		s.CleanupInterval = c.CleanupInterval
 		s.Ordered = c.Ordered
 		s.Notify = !c.DisableNotify
@@ -227,3 +239,24 @@ var schemaRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // ValidSchema reports whether s is a safe schema identifier.
 func ValidSchema(s string) bool { return schemaRe.MatchString(s) }
+
+// WithDeadRetention enables deletion of dead rows after this terminal-state age.
+// Disabled by default. Requires WithCleanupInterval.
+func WithDeadRetention(ttl time.Duration) Option { return func(s *Settings) { s.DeadRetention = ttl } }
+
+// WithDiscardRetention enables deletion of discarded rows after this age.
+// Disabled by default. Requires WithCleanupInterval.
+func WithDiscardRetention(ttl time.Duration) Option {
+	return func(s *Settings) { s.DiscardRetention = ttl }
+}
+
+// WithClearPayloadOnComplete atomically empties payload and headers when a row
+// becomes published or discarded. Dead rows retain data for inspection/replay.
+// Other columns (including LastError) are retained; callers must sanitize them.
+func WithClearPayloadOnComplete(enabled bool) Option {
+	return func(s *Settings) { s.ClearPayloadOnComplete = enabled }
+}
+
+// WithPublishTimeout limits each Publish call. Zero disables the timeout.
+// Publishers must honor the supplied context; a timeout cannot undo a side effect.
+func WithPublishTimeout(d time.Duration) Option { return func(s *Settings) { s.PublishTimeout = d } }

@@ -23,7 +23,7 @@ const NotifyChannel = "outbox_messages"
 
 const messageColumns = `id, topic, partition_key, payload, headers, content_type, ` +
 	`message_type, status, attempts, max_attempts, locked_by, locked_until, ` +
-	`next_attempt_at, last_error, created_at, published_at`
+	`next_attempt_at, last_error, created_at, published_at, lease_token, finished_at`
 
 // Store runs the outbox SQL. The relay/cleaner queries use exec (must not be
 // tx-bound); enqueue uses enq (joins the caller's business tx). pool is optional
@@ -87,20 +87,21 @@ func (s Store) claim(ctx context.Context, set config.Settings) ([]message.Messag
         SELECT 1 FROM %s e
         WHERE o.partition_key IS NOT NULL
           AND e.partition_key = o.partition_key
-          AND e.created_at < o.created_at
-          AND e.status <> 'published')`, s.table)
+          AND (e.created_at, e.id) < (o.created_at, o.id)
+          AND e.status NOT IN ('published', 'discarded'))`, s.table)
 	}
 	q := fmt.Sprintf(`
 UPDATE %s SET
     status = 'processing',
     locked_by = $1,
-    locked_until = now() + make_interval(secs => $2),
+    locked_until = clock_timestamp() + make_interval(secs => $2),
+    lease_token = gen_random_uuid(),
     attempts = attempts + 1
 WHERE id IN (
     SELECT o.id FROM %s o
     WHERE o.next_attempt_at <= now()
       AND (o.status = 'pending' OR (o.status = 'processing' AND o.locked_until < now()))%s
-    ORDER BY o.created_at
+    ORDER BY o.created_at, o.id
     FOR UPDATE SKIP LOCKED
     LIMIT $3
 )
@@ -114,42 +115,85 @@ RETURNING %s`, s.table, s.table, ordered, messageColumns)
 	return scanMessages(rows)
 }
 
-// markPublished marks the given ids published.
-func (s Store) markPublished(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
+// claimKeys identifies attempts rather than processes. Reusing an InstanceID
+// (or resetting attempts on replay) must never let an old worker finish new work.
+func claimKeys(msgs []message.Message) ([]string, []string) {
+	ids, tokens := make([]string, len(msgs)), make([]string, len(msgs))
+	for i, m := range msgs {
+		ids[i], tokens[i] = m.ID, m.LeaseToken
 	}
-	_, err := s.exec.Exec(ctx, fmt.Sprintf(
-		`UPDATE %s SET status='published', published_at=now(), locked_by=NULL, locked_until=NULL `+
-			`WHERE id = ANY($1)`, s.table), ids)
-	return err
+	return ids, tokens
 }
 
-// markRetry reschedules a message after a transient failure.
-func (s Store) markRetry(ctx context.Context, id, errMsg string, delay time.Duration) error {
-	_, err := s.exec.Exec(ctx, fmt.Sprintf(
-		`UPDATE %s SET status='pending', next_attempt_at=now()+make_interval(secs => $2), `+
-			`last_error=$3, locked_by=NULL, locked_until=NULL WHERE id=$1`, s.table),
-		id, delay.Seconds(), errMsg)
-	return err
+// renew extends only live leases owned by these attempts. Never resurrect an
+// expired lease, even if another worker has not claimed it yet.
+func (s Store) renew(ctx context.Context, msgs []message.Message, duration time.Duration) error {
+	ids, tokens := claimKeys(msgs)
+	tag, err := s.exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET
+ locked_until=clock_timestamp()+make_interval(secs => $3)
+ WHERE (id, lease_token) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
+ AND status='processing' AND locked_until > clock_timestamp()`, s.table), ids, tokens, duration.Seconds())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != int64(len(msgs)) {
+		return port.ErrLeaseLost
+	}
+	return nil
 }
 
-// markDead moves a message to the dead state after exhausting attempts.
-func (s Store) markDead(ctx context.Context, id, errMsg string) error {
-	_, err := s.exec.Exec(ctx, fmt.Sprintf(
-		`UPDATE %s SET status='dead', last_error=$2, locked_by=NULL, locked_until=NULL `+
-			`WHERE id=$1`, s.table), id, errMsg)
-	return err
+// finish changes only still-owned attempts. Returned rows are the committed
+// outcomes; hooks must never report success for a stale completion.
+func (s Store) finish(ctx context.Context, msgs []message.Message, status message.Status, reason string, delay time.Duration, clear bool) ([]message.Message, error) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	ids, tokens := claimKeys(msgs)
+	rows, err := s.exec.Query(ctx, fmt.Sprintf(`UPDATE %s SET
+ status=$3,
+ next_attempt_at=CASE WHEN $3='pending' THEN clock_timestamp()+make_interval(secs => $5) ELSE next_attempt_at END,
+ last_error=$4,
+ published_at=CASE WHEN $3='published' THEN clock_timestamp() ELSE NULL END,
+ finished_at=CASE WHEN $3='pending' THEN NULL ELSE clock_timestamp() END,
+ payload=CASE WHEN $6 AND $3 IN ('published','discarded') THEN ''::bytea ELSE payload END,
+ headers=CASE WHEN $6 AND $3 IN ('published','discarded') THEN '{}'::jsonb ELSE headers END,
+ locked_by=NULL, locked_until=NULL, lease_token=NULL
+ WHERE (id, lease_token) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
+ AND status='processing' AND locked_until > clock_timestamp()
+ RETURNING %s`, s.table, messageColumns), ids, tokens, string(status), nullStr(reason), delay.Seconds(), clear)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
 }
 
-// cleanup deletes up to limit published rows older than ttl. Returns the number
-// deleted.
-func (s Store) cleanup(ctx context.Context, ttl time.Duration, limit int) (int64, error) {
-	tag, err := s.exec.Exec(ctx, fmt.Sprintf(
-		`DELETE FROM %s WHERE id IN (
-            SELECT id FROM %s
-            WHERE status='published' AND published_at < now()-make_interval(secs => $1)
-            LIMIT $2)`, s.table, s.table), ttl.Seconds(), limit)
+// Requeue uses the caller's transactional executor. A locked row cannot be
+// removed by cleanup concurrently. Notifications become visible on commit.
+func (s Store) Requeue(ctx context.Context, id string) (bool, error) {
+	tag, err := s.enq.Exec(ctx, fmt.Sprintf(`WITH changed AS (
+ UPDATE %s SET status='pending', attempts=0, next_attempt_at=clock_timestamp(),
+ last_error=NULL, finished_at=NULL, published_at=NULL,
+ locked_by=NULL, locked_until=NULL, lease_token=NULL
+ WHERE id=$1 AND status='dead' RETURNING id
+ ) SELECT pg_notify('%s','') FROM changed`, s.table, NotifyChannel), id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// cleanup locks candidates so a concurrent replay cannot turn one into a
+// pending row between selection and deletion. Each retention is opt-in.
+func (s Store) cleanup(ctx context.Context, set config.Settings) (int64, error) {
+	tag, err := s.exec.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id IN (
+ SELECT id FROM %s WHERE
+ ($1::double precision > 0 AND status='published' AND published_at < now()-make_interval(secs => $1)) OR
+ ($2::double precision > 0 AND status='dead' AND finished_at < now()-make_interval(secs => $2)) OR
+ ($3::double precision > 0 AND status='discarded' AND finished_at < now()-make_interval(secs => $3))
+ ORDER BY COALESCE(finished_at, published_at), id
+ LIMIT $4 FOR UPDATE SKIP LOCKED
+ )`, s.table, s.table), set.Retention.Seconds(), set.DeadRetention.Seconds(), set.DiscardRetention.Seconds(), set.BatchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -160,17 +204,17 @@ func scanMessages(rows pgx.Rows) ([]message.Message, error) {
 	var out []message.Message
 	for rows.Next() {
 		var (
-			m          message.Message
-			pk, ct, mt *string
-			lb, le     *string
-			statusStr  string
-			ma         *int
-			lu, pub    *time.Time
-			headers    []byte
+			m                 message.Message
+			pk, ct, mt        *string
+			lb, le, token     *string
+			statusStr         string
+			ma                *int
+			lu, pub, finished *time.Time
+			headers           []byte
 		)
 		if err := rows.Scan(&m.ID, &m.Topic, &pk, &m.Payload, &headers, &ct, &mt,
 			&statusStr, &m.Attempts, &ma, &lb, &lu, &m.NextAttemptAt, &le,
-			&m.CreatedAt, &pub); err != nil {
+			&m.CreatedAt, &pub, &token, &finished); err != nil {
 			return nil, err
 		}
 		m.Status = message.Status(statusStr)
@@ -182,6 +226,8 @@ func scanMessages(rows pgx.Rows) ([]message.Message, error) {
 		m.MaxAttempts = ma
 		m.LockedUntil = lu
 		m.PublishedAt = pub
+		m.LeaseToken = derefStr(token)
+		m.FinishedAt = finished
 		if len(headers) > 0 {
 			if err := json.Unmarshal(headers, &m.Headers); err != nil {
 				return nil, fmt.Errorf("outbox: unmarshal headers: %w", err)
