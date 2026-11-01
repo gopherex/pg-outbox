@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -33,6 +34,19 @@ func TestDefault(t *testing.T) {
 	}
 	if s.Logger == nil {
 		t.Error("logger should default to a non-nil no-op logger")
+	}
+	if s.Fatal == nil || s.Fatal(errors.New("x")) {
+		t.Error("fatal classifier should default to never fatal")
+	}
+}
+
+func TestWithFatal(t *testing.T) {
+	t.Parallel()
+	if s := Resolve(WithFatal(nil)); s.Fatal == nil {
+		t.Fatal("nil classifier must keep the default")
+	}
+	if s := Resolve(WithFatal(func(error) bool { return true })); !s.Fatal(errors.New("x")) {
+		t.Fatal("classifier not applied")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -37,6 +38,10 @@ func (r *Relay) processBatch(ctx context.Context) (int, error) {
 	}
 
 	perr, leaseErr := r.publish(ctx, msgs)
+	if perr != nil && isFatal(ctx, r.set, perr) {
+		// The batch stays claimed: completion would retry or dead-letter it.
+		return len(msgs), fatalError{perr}
+	}
 	if leaseErr != nil {
 		return len(msgs), leaseErr
 	}
@@ -132,34 +137,7 @@ func (r *Relay) publish(ctx context.Context, msgs []message.Message) (error, err
 	}
 	stop := make(chan struct{})
 	done := make(chan error, 1)
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				done <- nil
-				return
-			case <-pubCtx.Done():
-				done <- nil
-				return
-			case <-ticker.C:
-				renewCtx, renewCancel := context.WithTimeout(pubCtx, interval)
-				err := r.store.renew(renewCtx, msgs, r.set.LeaseDuration)
-				renewCancel()
-				if err != nil {
-					// Cancellation of the call itself is not a lease renewal failure.
-					if pubCtx.Err() != nil {
-						done <- nil
-						return
-					}
-					cancel()
-					done <- fmt.Errorf("outbox: renew claims: %w", err)
-					return
-				}
-			}
-		}
-	}()
+	go func() { done <- recovered(func() error { return r.heartbeat(pubCtx, cancel, stop, msgs, interval) }) }()
 	// Keep claim identity private: adapters may modify the slice they receive,
 	// while the heartbeat and completion must use the original claim tokens.
 	perr := r.pub.Publish(pubCtx, append([]message.Message(nil), msgs...))
@@ -167,25 +145,98 @@ func (r *Relay) publish(ctx context.Context, msgs []message.Message) (error, err
 	return perr, <-done
 }
 
-// drain processes batches until fewer than batchSize rows are claimed (i.e. the
-// ready queue is empty for now).
-func (r *Relay) drain(ctx context.Context) {
-	for ctx.Err() == nil {
-		n, err := r.processBatch(ctx)
-		if err != nil {
-			r.set.Logger.Error("outbox: relay batch failed", "err", err)
-			return
-		}
-		if n < r.set.BatchSize {
-			return
+func (r *Relay) heartbeat(ctx context.Context, cancel context.CancelFunc, stop <-chan struct{}, msgs []message.Message, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			renewCtx, renewCancel := context.WithTimeout(ctx, interval)
+			err := r.store.renew(renewCtx, msgs, r.set.LeaseDuration)
+			renewCancel()
+			if err != nil {
+				// Cancellation of the call itself is not a lease renewal failure.
+				if ctx.Err() != nil {
+					return nil
+				}
+				cancel()
+				return fmt.Errorf("outbox: renew claims: %w", err)
+			}
 		}
 	}
 }
 
+// fatalError marks a publish error already classified as fatal, so the
+// classifier is consulted once per error.
+type fatalError struct{ err error }
+
+func (e fatalError) Error() string { return e.err.Error() }
+
+// isFatal reports whether err must stop the relay. Abort outcomes and recovered
+// panics always do; anything else only through the caller's classifier, and
+// never once ctx is done (errors caused by shutdown are not failures).
+func isFatal(ctx context.Context, set config.Settings, err error) bool {
+	var abort *port.AbortError
+	var panicked *port.PanicError
+	if errors.As(err, &abort) || errors.As(err, &panicked) {
+		return true
+	}
+	return ctx.Err() == nil && set.Fatal(err)
+}
+
+// recovered runs fn and converts a panic into a *port.PanicError.
+func recovered(fn func() error) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &port.PanicError{Value: v, Stack: debug.Stack()}
+		}
+	}()
+	return fn()
+}
+
+// drain processes batches until fewer than batchSize rows are claimed (i.e. the
+// ready queue is empty for now). It returns only fatal errors.
+func (r *Relay) drain(ctx context.Context) error {
+	for ctx.Err() == nil {
+		n, err := r.processBatch(ctx)
+		if err != nil {
+			var classified fatalError
+			if errors.As(err, &classified) {
+				return classified.err
+			}
+			if isFatal(ctx, r.set, err) {
+				return err
+			}
+			r.set.Logger.Error("outbox: relay batch failed", "err", err)
+			return nil
+		}
+		if n < r.set.BatchSize {
+			return nil
+		}
+	}
+	return nil
+}
+
 // Run starts the relay: set.Concurrency worker goroutines plus an optional
-// LISTEN/NOTIFY listener. It blocks until ctx is cancelled, then drains in
-// flight work and returns.
+// LISTEN/NOTIFY listener. It blocks until ctx is cancelled and returns nil, or
+// until a fatal error (see isFatal) stops every worker; then it returns that
+// error. Panics in any relay goroutine are recovered as *port.PanicError.
 func (r *Relay) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		once    sync.Once
+		failure error
+	)
+	fail := func(err error) {
+		if err != nil {
+			once.Do(func() { failure = err; cancel() })
+		}
+	}
 	wake := make(chan struct{}, 1)
 	var wg sync.WaitGroup
 
@@ -195,7 +246,7 @@ func (r *Relay) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.listen(ctx, wake)
+			fail(recovered(func() error { r.listen(ctx, wake); return nil }))
 		}()
 	} else if r.set.Notify {
 		r.set.Logger.Warn("outbox: no listen pool configured, relay runs poll-only")
@@ -205,24 +256,26 @@ func (r *Relay) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.worker(ctx, wake)
+			fail(recovered(func() error { return r.worker(ctx, wake) }))
 		}()
 	}
 	wg.Wait()
-	return nil
+	return failure
 }
 
-func (r *Relay) worker(ctx context.Context, wake <-chan struct{}) {
+func (r *Relay) worker(ctx context.Context, wake <-chan struct{}) error {
 	ticker := time.NewTicker(r.set.PollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 		case <-wake:
 		}
-		r.drain(ctx)
+		if err := r.drain(ctx); err != nil {
+			return err
+		}
 	}
 }
 

@@ -52,8 +52,9 @@ err = tx.DoSerializable(ctx, mgr, func(ctx context.Context) error {
     })
 })
 
-// In a background goroutine:
-go ob.Run(ctx) // blocks until ctx is cancelled, then drains and returns
+// Under the service lifecycle: blocks until ctx is cancelled (returns ctx.Err())
+// or until a fatal error stops the relay (returns that error).
+err = ob.Run(ctx)
 ```
 
 Use a contrib publisher:
@@ -146,14 +147,37 @@ A publisher can return these wrapped outcomes (recognized through `errors.As`):
 return outbox.Permanent(err)                  // dead immediately
 return outbox.RetryAfter(err, 2*time.Minute)   // minimum delay; attempt limit still applies
 return outbox.Discard(reason)                 // terminal, without publication or dead-letter
+return outbox.Abort(err)                      // stop the relay; batch left claimed
 ```
 
 These outcomes apply to **every message in the batch**. Use `WithBatchSize(1)`
 for independent outcomes and `WithConcurrency` for parallelism. RetryAfter
 uses the greater of its delay and the configured backoff; zero/negative delays
 never reduce backoff. Wrappers preserve `errors.Is` / `errors.As`. Do not mix
-outcome markers; if nested/joined, Permanent takes precedence over Discard,
-then RetryAfter. Nil causes still produce the requested outcome.
+outcome markers; if nested/joined, Abort takes precedence over Permanent, then
+Discard, then RetryAfter. Nil causes still produce the requested outcome.
+
+### Fatal stop and panics
+
+A fatal error stops the relay and the cleaner, and `Run` returns it to the
+caller's lifecycle. The batch it hit is **not** completed, retried or
+dead-lettered: its rows stay `processing` under their lease, and another
+instance (or the restarted one) re-claims them once the lease expires. Other
+workers are cancelled exactly as on a normal shutdown. Fatal errors are:
+
+- `outbox.Abort(err)` returned by the publisher (or by a custom `Executor`);
+- a panic anywhere in the relay or cleaner (publisher, hooks, executor, lease
+  renewal): it is recovered as `*outbox.PanicError` with the panic `Value` and
+  `Stack`, never crashes the process, and is always fatal. A panicked `error`
+  value is reachable through `errors.Is` / `errors.As`;
+- any error the `WithFatal` classifier accepts. It is consulted on every
+  Publish error and on every internal error (claim, renew, completion,
+  cleanup) while the context is live; errors caused by cancellation are never
+  classified. Default: nothing else is fatal.
+
+```go
+outbox.WithFatal(func(err error) bool { return errors.Is(err, errBrokerGone) })
+```
 
 The library treats payloads as opaque bytes. Application policy, deadlines,
 provider error classification, recipient preferences, and authorization belong

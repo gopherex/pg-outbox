@@ -17,7 +17,6 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"sync"
 
 	"github.com/gopherex/pg-outbox/backoff"
 	"github.com/gopherex/pg-outbox/config"
@@ -46,6 +45,8 @@ type (
 	PermanentError  = port.PermanentError
 	RetryAfterError = port.RetryAfterError
 	DiscardError    = port.DiscardError
+	AbortError      = port.AbortError
+	PanicError      = port.PanicError
 	// NoopHooks is the default no-op Hooks implementation.
 	NoopHooks = port.NoopHooks
 	// Executor is the pluggable pgx query surface (Exec, Query, QueryRow).
@@ -95,6 +96,7 @@ var (
 	WithOrdered                = config.WithOrdered
 	WithoutNotify              = config.WithoutNotify
 	WithListenPool             = config.WithListenPool
+	WithFatal                  = config.WithFatal
 	WithHooks                  = config.WithHooks
 	WithCodec                  = config.WithCodec
 	WithLogger                 = config.WithLogger
@@ -105,6 +107,7 @@ var (
 	Permanent    = port.Permanent
 	RetryAfter   = port.RetryAfter
 	Discard      = port.Discard
+	Abort        = port.Abort
 	ErrLeaseLost = port.ErrLeaseLost
 )
 
@@ -238,23 +241,26 @@ func (o *Outbox) Requeue(ctx context.Context, id string) (bool, error) {
 	return o.store.Requeue(ctx, id)
 }
 
-// Run starts the relay and cleaner and blocks until ctx is cancelled. The lease
-// owner id was resolved at New time (WithInstanceID, or auto-generated).
+// Run starts the relay and cleaner and blocks until ctx is cancelled, then
+// returns ctx.Err(). A fatal error (an Abort outcome, a recovered panic, or an
+// error the WithFatal classifier accepts) stops both and is returned instead;
+// the batch it hit stays claimed and is re-claimed after its lease expires.
+// The lease owner id was resolved at New time (WithInstanceID, or auto-generated).
 func (o *Outbox) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if err := o.relay.Run(ctx); err != nil {
-			o.set.Logger.Error("outbox: relay stopped", "err", err)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, 2)
+	go func() { errs <- o.relay.Run(runCtx) }()
+	go func() { errs <- o.clean.Run(runCtx) }()
+	var failure error
+	for range 2 {
+		if err := <-errs; err != nil && failure == nil {
+			failure = err
+			cancel()
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		if err := o.clean.Run(ctx); err != nil {
-			o.set.Logger.Error("outbox: cleaner stopped", "err", err)
-		}
-	}()
-	wg.Wait()
+	}
+	if failure != nil {
+		return failure
+	}
 	return ctx.Err()
 }

@@ -19,8 +19,13 @@ func NewCleaner(s Store, set config.Settings) *Cleaner {
 }
 
 // Run is a no-op unless at least one retention window and the cleanup
-// interval are set. Otherwise it blocks until ctx is cancelled.
+// interval are set. Otherwise it blocks until ctx is cancelled and returns nil,
+// or returns the first fatal error (see isFatal), including a recovered panic.
 func (c *Cleaner) Run(ctx context.Context) error {
+	return recovered(func() error { return c.run(ctx) })
+}
+
+func (c *Cleaner) run(ctx context.Context) error {
 	if c.set.CleanupInterval <= 0 || (c.set.Retention <= 0 && c.set.DeadRetention <= 0 && c.set.DiscardRetention <= 0) {
 		return nil
 	}
@@ -35,6 +40,9 @@ func (c *Cleaner) Run(ctx context.Context) error {
 		for ctx.Err() == nil {
 			n, err := c.store.cleanup(ctx, c.set)
 			if err != nil {
+				if isFatal(ctx, c.set, err) {
+					return err
+				}
 				c.set.Logger.Error("outbox: cleanup failed", "err", err)
 				break
 			}

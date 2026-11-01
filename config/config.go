@@ -40,6 +40,7 @@ type Settings struct {
 	Ordered                bool
 	Notify                 bool
 	ListenPool             *pgxpool.Pool
+	Fatal                  func(error) bool
 	Hooks                  port.Hooks
 	Codec                  port.Codec
 	Logger                 *slog.Logger
@@ -56,6 +57,7 @@ func Default() Settings {
 		MaxAttempts:   10,
 		Backoff:       backoff.Default,
 		Notify:        true,
+		Fatal:         neverFatal,
 		Hooks:         port.NoopHooks{},
 		Logger:        slog.New(slog.DiscardHandler), // no-op until the caller supplies one
 	}
@@ -91,6 +93,9 @@ func Resolve(opts ...Option) Settings {
 	}
 	if s.Backoff == nil {
 		s.Backoff = d.Backoff
+	}
+	if s.Fatal == nil {
+		s.Fatal = d.Fatal
 	}
 	if s.Hooks == nil {
 		s.Hooks = d.Hooks
@@ -212,6 +217,22 @@ func WithoutNotify() Option { return func(s *Settings) { s.Notify = false } }
 // Without it (and unless the relay executor is itself a *pgxpool.Pool), the
 // relay falls back to polling only.
 func WithListenPool(p *pgxpool.Pool) Option { return func(s *Settings) { s.ListenPool = p } }
+
+// WithFatal sets the classifier consulted on every Publish error and every
+// internal relay/cleaner error (claim, renew, completion, cleanup) while the
+// context is live. When it returns true, Run stops and returns the error; the
+// claimed batch is not completed, retried or dead-lettered and is re-claimed
+// after its lease expires. Abort outcomes and recovered panics are always fatal.
+// Default: nothing else is fatal.
+func WithFatal(f func(error) bool) Option {
+	return func(s *Settings) {
+		if f != nil {
+			s.Fatal = f
+		}
+	}
+}
+
+func neverFatal(error) bool { return false }
 
 // WithHooks sets the observability hooks (default NoopHooks).
 func WithHooks(h port.Hooks) Option {
