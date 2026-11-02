@@ -3,7 +3,7 @@ module github.com/gopherex/pg-outbox/contrib/publishers/valkey
 go 1.25.0
 
 require (
-	github.com/gopherex/pg-outbox v1.1.3
+	github.com/gopherex/pg-outbox v1.2.0
 	github.com/valkey-io/valkey-go v1.0.75
 )
 
