@@ -198,8 +198,11 @@ func recovered(fn func() error) (err error) {
 	return fn()
 }
 
-// drain processes batches until fewer than batchSize rows are claimed (i.e. the
-// ready queue is empty for now). It returns only fatal errors.
+// drain processes batches until a pass claims nothing (the ready queue is empty
+// for now). A short batch is not enough: ordered mode claims one head row per
+// partition key, so a single key yields short batches while rows remain. Rows
+// rescheduled with a backoff are not due, so the loop terminates. It returns
+// only fatal errors.
 func (r *Relay) drain(ctx context.Context) error {
 	for ctx.Err() == nil {
 		n, err := r.processBatch(ctx)
@@ -214,7 +217,7 @@ func (r *Relay) drain(ctx context.Context) error {
 			r.set.Logger.Error("outbox: relay batch failed", "err", err)
 			return nil
 		}
-		if n < r.set.BatchSize {
+		if n == 0 {
 			return nil
 		}
 	}

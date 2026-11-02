@@ -269,7 +269,11 @@ NATS and Valkey dependencies never enter the core module's `go.mod`.
   per-`PartitionKey` ordering (creation time, then ID); a `dead` row blocks its
   key until resolved or removed. Published/discarded rows do not block it.
 - **Latency.** A trigger fires `NOTIFY`; the relay wakes near-instantly and
-  falls back to polling every `WithPollInterval`.
+  falls back to polling every `WithPollInterval`. Once awake it keeps claiming
+  until a pass finds nothing due, so a backlog (including a long run of one
+  key in ordered mode) drains without waiting for the next poll.
+- **Scheduling.** None: an enqueued row is due immediately; `NextAttemptAt` is
+  set only by retry backoff.
 
 ## Notes
 

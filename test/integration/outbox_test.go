@@ -115,6 +115,46 @@ func TestRetryThenDead(t *testing.T) {
 	cancel()
 }
 
+// Ordered mode claims only the head row of a partition key per pass, so every
+// pass over a single key is short. The relay must keep draining instead of
+// sleeping PollInterval between rows.
+func TestOrderedSingleKeyDrainsWithoutPollWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := newTestPool(t)
+
+	const n = 50
+	msgs := make([]outbox.Message, n)
+	for i := range msgs {
+		msgs[i] = outbox.Message{Topic: "t", PartitionKey: "k", Payload: []byte{byte(i)}}
+	}
+	pub := &capturePublisher{}
+	ob, err := outbox.New(pool, pool, pub,
+		outbox.WithInstanceID("ordered"),
+		outbox.WithOrdered(true),
+		outbox.WithoutNotify(),
+		outbox.WithPollInterval(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := ob.EnqueueBatch(ctx, msgs); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+
+	go func() { _ = ob.Run(ctx) }()
+
+	// One poll tick, then the whole key; one tick per row would take n seconds.
+	waitFor(t, 5*time.Second, func() bool { return len(pub.published()) == n })
+	// One INSERT shares created_at, so the claim order falls back to the id.
+	got := pub.published()
+	for i := 1; i < len(got); i++ {
+		if got[i-1].ID >= got[i].ID {
+			t.Fatalf("out of order at %d: %s before %s", i, got[i-1].ID, got[i].ID)
+		}
+	}
+}
+
 // The cleaner deletes published rows older than the retention window.
 func TestCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
