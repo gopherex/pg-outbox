@@ -447,6 +447,118 @@ func TestEnqueueAtomicWithCallerTransaction(t *testing.T) {
 	}
 }
 
+// A per-message outcome settles only its own row; rows without an entry take
+// the batch-level outcome (nil: published, joining the published group).
+func TestPerMessageOutcomes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                string
+		others              error
+		absent              string
+		published, discards int32
+	}{
+		{name: "others published", others: nil, absent: "published", published: 1, discards: 1},
+		{name: "others discarded", others: outbox.Discard(errors.New("skipped")), absent: "discarded", published: 1, discards: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := newTestPool(t)
+			ctx := context.Background()
+			seed, err := outbox.New(pool, pool, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			topics := []string{"ok", "permanent", "discard", "retry", "absent"}
+			msgs := make([]outbox.Message, len(topics))
+			for i, topic := range topics {
+				msgs[i] = outbox.Message{Topic: topic, Payload: []byte("x")}
+			}
+			if err := seed.EnqueueBatch(ctx, msgs); err != nil {
+				t.Fatal(err)
+			}
+			cause := errors.New("refused")
+			var batches atomic.Int32
+			hooks := &outcomeHooks{}
+			relay(t, pool, publisherFunc(func(_ context.Context, ms []outbox.Message) error {
+				batches.Add(1)
+				outcomes := map[string]error{}
+				for _, m := range ms {
+					switch m.Topic {
+					case "ok":
+						outcomes[m.ID] = nil
+					case "permanent":
+						outcomes[m.ID] = outbox.Permanent(cause)
+					case "discard":
+						outcomes[m.ID] = outbox.Discard(cause)
+					case "retry":
+						outcomes[m.ID] = outbox.RetryAfter(cause, time.Hour)
+					}
+				}
+				return outbox.PerMessage(outcomes, tc.others)
+			}), outbox.WithBatchSize(len(topics)), outbox.WithHooks(hooks))
+
+			for topic, want := range map[string]string{"ok": "published", "permanent": "dead", "discard": "discarded", "retry": "pending", "absent": tc.absent} {
+				waitStatus(t, pool, topic, want)
+			}
+			waitFor(t, 5*time.Second, func() bool {
+				return hooks.published.Load() == tc.published && hooks.dead.Load() == 1 && hooks.discarded.Load() == tc.discards && hooks.failed.Load() == 1
+			})
+			if n := batches.Load(); n != 1 {
+				t.Fatalf("publisher called %d times, want one batch", n)
+			}
+			var lastError string
+			var delayed bool
+			if err := pool.QueryRow(ctx, "SELECT last_error, next_attempt_at > now()+interval '50 minutes' FROM outbox_messages WHERE topic='retry'").Scan(&lastError, &delayed); err != nil {
+				t.Fatal(err)
+			}
+			if lastError != "refused" || !delayed {
+				t.Fatalf("retry row: last_error=%q delayed=%v", lastError, delayed)
+			}
+		})
+	}
+}
+
+// In ordered mode a failed head holds only its own key; the head of another key
+// in the same batch is published and its key keeps flowing.
+func TestPerMessageOrderedHoldsOnlyFailedKey(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	seed, err := outbox.New(pool, pool, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msgs []outbox.Message
+	for _, key := range []string{"held", "free"} {
+		for _, n := range []string{"1", "2"} {
+			msgs = append(msgs, outbox.Message{Topic: key + n, PartitionKey: key, Payload: []byte("x")})
+		}
+	}
+	if err := seed.EnqueueBatch(ctx, msgs); err != nil {
+		t.Fatal(err)
+	}
+	relay(t, pool, publisherFunc(func(_ context.Context, ms []outbox.Message) error {
+		outcomes := map[string]error{}
+		for _, m := range ms {
+			if m.Topic == "held1" {
+				outcomes[m.ID] = outbox.RetryAfter(errors.New("busy"), time.Hour)
+			}
+		}
+		return outbox.PerMessage(outcomes, nil)
+	}), outbox.WithBatchSize(len(msgs)), outbox.WithOrdered(true))
+
+	waitStatus(t, pool, "free1", "published")
+	waitStatus(t, pool, "free2", "published")
+	var held1, held2 int
+	if err := pool.QueryRow(ctx, `SELECT
+ (SELECT attempts FROM outbox_messages WHERE topic='held1' AND status='pending'),
+ (SELECT attempts FROM outbox_messages WHERE topic='held2' AND status='pending')`).Scan(&held1, &held2); err != nil {
+		t.Fatal(err)
+	}
+	if held1 != 1 || held2 != 0 {
+		t.Fatalf("held key: head attempts=%d, follower attempts=%d, want 1 and 0", held1, held2)
+	}
+}
+
 func TestOrderedDiscardAndReplay(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()

@@ -59,6 +59,16 @@ func TestFatalStopLeavesBatchClaimed(t *testing.T) {
 			},
 		},
 		{
+			name: "abort in a per-message outcome",
+			pub: func(_ context.Context, ms []outbox.Message) error {
+				return outbox.PerMessage(map[string]error{ms[0].ID: outbox.Abort(errBroken)}, nil)
+			},
+			check: func(err error) bool {
+				var a *outbox.AbortError
+				return errors.As(err, &a) && errors.Is(err, errBroken)
+			},
+		},
+		{
 			name: "classified publish error",
 			pub:  func(context.Context, []outbox.Message) error { return errBroken },
 			opts: []outbox.Option{outbox.WithFatal(func(err error) bool { return errors.Is(err, errBroken) })},

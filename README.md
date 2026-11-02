@@ -150,12 +150,30 @@ return outbox.Discard(reason)                 // terminal, without publication o
 return outbox.Abort(err)                      // stop the relay; batch left claimed
 ```
 
-These outcomes apply to **every message in the batch**. Use `WithBatchSize(1)`
-for independent outcomes and `WithConcurrency` for parallelism. RetryAfter
-uses the greater of its delay and the configured backoff; zero/negative delays
-never reduce backoff. Wrappers preserve `errors.Is` / `errors.As`. Do not mix
-outcome markers; if nested/joined, Abort takes precedence over Permanent, then
-Discard, then RetryAfter. Nil causes still produce the requested outcome.
+These outcomes apply to **every message in the batch**. RetryAfter uses the
+greater of its delay and the configured backoff; zero/negative delays never
+reduce backoff. Wrappers preserve `errors.Is` / `errors.As`. Do not mix
+outcome markers; if nested/joined, Abort takes precedence over PerMessage, then
+Permanent, then Discard, then RetryAfter. Nil causes still produce the
+requested outcome.
+
+For a batch of unrelated messages, give each its own outcome, keyed by
+`Message.ID`:
+
+```go
+return outbox.PerMessage(map[string]error{
+    a.ID: outbox.Permanent(err),           // only a is dead
+    c.ID: outbox.RetryAfter(err, time.Minute),
+}, nil)                                    // every other message: published
+```
+
+A `nil` entry means published; a non-nil entry is settled exactly like the
+whole-batch outcomes above (a plain error retries with backoff). Messages
+without an entry take the second argument as their outcome. IDs outside the
+batch are ignored. An Abort in any entry stops the relay with the whole batch
+left claimed, and a `WithFatal` classifier sees the whole `*BatchError`
+(`errors.Is` / `errors.As` reach every entry). In ordered mode each failed head
+holds only its own key, exactly as with a whole-batch failure.
 
 ### Fatal stop and panics
 

@@ -56,6 +56,52 @@ func (e *DiscardError) Unwrap() error { return e.Err }
 // Discard completes a batch without publication or dead-lettering.
 func Discard(reason error) error { return &DiscardError{Err: reason} }
 
+// BatchError gives each message of a batch its own outcome, keyed by
+// Message.ID. A nil value means published; a non-nil value is settled exactly
+// like a whole-batch error (Permanent, Discard, RetryAfter, or a plain error
+// that retries with backoff). Messages without an entry take Err as their
+// outcome, so a nil Err publishes them. IDs outside the batch are ignored.
+// Abort anywhere in it stops the relay with the batch left claimed.
+// Use PerMessage to construct one. It supports errors.Is and errors.As over Err
+// and every outcome.
+type BatchError struct {
+	Outcomes map[string]error
+	Err      error
+}
+
+func (e *BatchError) Error() string {
+	failed := 0
+	for _, err := range e.Outcomes {
+		if err != nil {
+			failed++
+		}
+	}
+	msg := fmt.Sprintf("outbox: %d message(s) failed", failed)
+	if e.Err != nil {
+		msg += "; others: " + e.Err.Error()
+	}
+	return msg
+}
+
+func (e *BatchError) Unwrap() []error {
+	errs := make([]error, 0, len(e.Outcomes)+1)
+	if e.Err != nil {
+		errs = append(errs, e.Err)
+	}
+	for _, err := range e.Outcomes {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+// PerMessage settles each message by its own outcome; messages missing from
+// outcomes take others (nil publishes them).
+func PerMessage(outcomes map[string]error, others error) error {
+	return &BatchError{Outcomes: outcomes, Err: others}
+}
+
 // AbortError stops the relay: Run returns it and the claimed batch is left
 // untouched under its lease, so another instance or a restart re-claims it
 // after expiry. It takes precedence over every other outcome.

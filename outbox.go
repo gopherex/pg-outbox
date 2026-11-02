@@ -46,6 +46,7 @@ type (
 	RetryAfterError = port.RetryAfterError
 	DiscardError    = port.DiscardError
 	AbortError      = port.AbortError
+	BatchError      = port.BatchError
 	PanicError      = port.PanicError
 	// NoopHooks is the default no-op Hooks implementation.
 	NoopHooks = port.NoopHooks
@@ -102,12 +103,14 @@ var (
 	WithLogger                 = config.WithLogger
 )
 
-// Publisher outcome controls apply to the whole batch and preserve wrapped errors.
+// Publisher outcome controls apply to the whole batch, or per message through
+// PerMessage, and preserve wrapped errors.
 var (
 	Permanent    = port.Permanent
 	RetryAfter   = port.RetryAfter
 	Discard      = port.Discard
 	Abort        = port.Abort
+	PerMessage   = port.PerMessage
 	ErrLeaseLost = port.ErrLeaseLost
 )
 

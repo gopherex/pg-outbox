@@ -37,7 +37,26 @@ func TestOutcomeWrapping(t *testing.T) {
 	if (&PanicError{Value: "text"}).Unwrap() != nil {
 		t.Fatal("non-error panic value must not unwrap")
 	}
-	for _, err := range []error{Permanent(nil), RetryAfter(nil, 0), Discard(nil), Abort(nil)} {
+	batch := fmt.Errorf("wrapped: %w", PerMessage(map[string]error{"a": nil, "b": Abort(cause)}, Discard(nil)))
+	var per *BatchError
+	if !errors.As(batch, &per) || len(per.Outcomes) != 2 {
+		t.Fatal("missing per-message marker")
+	}
+	if !errors.As(batch, &abort) || !errors.As(batch, &discard) || !errors.Is(batch, cause) {
+		t.Fatal("per-message outcomes must stay visible to errors.As and errors.Is")
+	}
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{PerMessage(map[string]error{"a": nil, "b": cause}, nil), "outbox: 1 message(s) failed"},
+		{PerMessage(nil, cause), "outbox: 0 message(s) failed; others: transport failure"},
+	} {
+		if got := tc.err.Error(); got != tc.want {
+			t.Fatalf("batch text = %q, want %q", got, tc.want)
+		}
+	}
+	for _, err := range []error{Permanent(nil), RetryAfter(nil, 0), Discard(nil), Abort(nil), PerMessage(nil, nil)} {
 		if err == nil || err.Error() == "" {
 			t.Fatal("nil cause must still express an outcome")
 		}

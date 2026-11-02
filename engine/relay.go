@@ -45,17 +45,52 @@ func (r *Relay) processBatch(ctx context.Context) (int, error) {
 	if leaseErr != nil {
 		return len(msgs), leaseErr
 	}
+	var batch *port.BatchError
+	if errors.As(perr, &batch) {
+		return len(msgs), r.settleEach(ctx, msgs, batch)
+	}
+	return len(msgs), r.settle(ctx, msgs, perr)
+}
+
+// settleEach settles every message by its own outcome. Published messages and
+// those taking the batch-level outcome are each settled as one group.
+func (r *Relay) settleEach(ctx context.Context, msgs []message.Message, batch *port.BatchError) error {
+	var published, others []message.Message
+	var errs []error
+	for _, m := range msgs {
+		outcome, ok := batch.Outcomes[m.ID]
+		if !ok {
+			outcome = batch.Err
+		}
+		switch {
+		case outcome == nil:
+			published = append(published, m)
+		case !ok:
+			others = append(others, m)
+		default:
+			errs = append(errs, r.settle(ctx, []message.Message{m}, outcome))
+		}
+	}
+	errs = append(errs, r.settle(ctx, published, nil), r.settle(ctx, others, batch.Err))
+	return errors.Join(errs...)
+}
+
+// settle records one publish outcome for every message in msgs.
+func (r *Relay) settle(ctx context.Context, msgs []message.Message, perr error) error {
+	if len(msgs) == 0 {
+		return nil
+	}
 	if perr == nil {
-		return len(msgs), r.complete(ctx, msgs, message.StatusPublished, nil, 0)
+		return r.complete(ctx, msgs, message.StatusPublished, nil, 0)
 	}
 	var permanent *port.PermanentError
 	var discarded *port.DiscardError
 	var retry *port.RetryAfterError
 	switch {
 	case errors.As(perr, &permanent):
-		return len(msgs), r.complete(ctx, msgs, message.StatusDead, perr, 0)
+		return r.complete(ctx, msgs, message.StatusDead, perr, 0)
 	case errors.As(perr, &discarded):
-		return len(msgs), r.complete(ctx, msgs, message.StatusDiscarded, perr, 0)
+		return r.complete(ctx, msgs, message.StatusDiscarded, perr, 0)
 	}
 	errors.As(perr, &retry)
 	// Attempt counts and per-message limits may differ inside one failed batch.
@@ -83,7 +118,7 @@ func (r *Relay) processBatch(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 		}
 	}
-	return len(msgs), errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 func (r *Relay) complete(ctx context.Context, msgs []message.Message, status message.Status, cause error, delay time.Duration) error {

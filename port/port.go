@@ -16,10 +16,10 @@ import (
 //
 // A non-nil error fails the whole batch: every message is retried (or
 // dead-lettered) per the relay's policy. Because delivery is at-least-once and a
-// partial-success batch is re-published in full, consumers must deduplicate. For
-// strict per-message isolation, run the relay with batch size 1. Permanent,
-// RetryAfter, Discard and Abort control the outcome of the entire batch; a
-// panic is recovered and stops the relay like Abort. Publish must
+// retried batch is re-published in full, consumers must deduplicate. Permanent,
+// RetryAfter, Discard and Abort control the outcome of the entire batch;
+// PerMessage gives each message its own outcome. A panic is recovered and stops
+// the relay like Abort. Publish must
 // honor context cancellation; claims are renewed while it runs.
 type Publisher interface {
 	Publish(ctx context.Context, msgs []message.Message) error
