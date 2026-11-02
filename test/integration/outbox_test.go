@@ -6,6 +6,7 @@ import (
 	"time"
 
 	outbox "github.com/gopherex/pg-outbox"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // End-to-end: a message enqueued is delivered by the running relay.
@@ -115,43 +116,76 @@ func TestRetryThenDead(t *testing.T) {
 	cancel()
 }
 
-// Ordered mode claims only the head row of a partition key per pass, so every
-// pass over a single key is short. The relay must keep draining instead of
+// Rows of one key written in one transaction share created_at; ordered mode
+// must still deliver them in insertion order. It claims only the head row of a
+// key per pass, so every pass is short: the relay must keep draining instead of
 // sleeping PollInterval between rows.
-func TestOrderedSingleKeyDrainsWithoutPollWaits(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	pool := newTestPool(t)
-
+func TestOrderedSingleKeyInsertionOrder(t *testing.T) {
+	t.Parallel()
 	const n = 50
-	msgs := make([]outbox.Message, n)
-	for i := range msgs {
-		msgs[i] = outbox.Message{Topic: "t", PartitionKey: "k", Payload: []byte{byte(i)}}
-	}
-	pub := &capturePublisher{}
-	ob, err := outbox.New(pool, pool, pub,
-		outbox.WithInstanceID("ordered"),
-		outbox.WithOrdered(true),
-		outbox.WithoutNotify(),
-		outbox.WithPollInterval(time.Second),
-	)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if err := ob.EnqueueBatch(ctx, msgs); err != nil {
-		t.Fatalf("EnqueueBatch: %v", err)
-	}
+	for _, tc := range []struct {
+		name    string
+		enqueue func(ctx context.Context, pool *pgxpool.Pool, msgs []outbox.Message) error
+	}{
+		{name: "one EnqueueBatch", enqueue: func(ctx context.Context, pool *pgxpool.Pool, msgs []outbox.Message) error {
+			ob, err := outbox.New(pool, pool, nil)
+			if err != nil {
+				return err
+			}
+			return ob.EnqueueBatch(ctx, msgs)
+		}},
+		{name: "Enqueue calls in one transaction", enqueue: func(ctx context.Context, pool *pgxpool.Pool, msgs []outbox.Message) error {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			ob, err := outbox.New(pool, tx, nil)
+			if err != nil {
+				return err
+			}
+			for _, m := range msgs {
+				if err := ob.Enqueue(ctx, m); err != nil {
+					return err
+				}
+			}
+			return tx.Commit(ctx)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pool := newTestPool(t)
 
-	go func() { _ = ob.Run(ctx) }()
+			msgs := make([]outbox.Message, n)
+			for i := range msgs {
+				msgs[i] = outbox.Message{Topic: "t", PartitionKey: "k", Payload: []byte{byte(i)}}
+			}
+			if err := tc.enqueue(ctx, pool, msgs); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			pub := &capturePublisher{}
+			ob, err := outbox.New(pool, pool, pub,
+				outbox.WithInstanceID("ordered"),
+				outbox.WithOrdered(true),
+				outbox.WithoutNotify(),
+				outbox.WithPollInterval(time.Second),
+			)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
 
-	// One poll tick, then the whole key; one tick per row would take n seconds.
-	waitFor(t, 5*time.Second, func() bool { return len(pub.published()) == n })
-	// One INSERT shares created_at, so the claim order falls back to the id.
-	got := pub.published()
-	for i := 1; i < len(got); i++ {
-		if got[i-1].ID >= got[i].ID {
-			t.Fatalf("out of order at %d: %s before %s", i, got[i-1].ID, got[i].ID)
-		}
+			go func() { _ = ob.Run(ctx) }()
+
+			// One poll tick, then the whole key; one tick per row would take n seconds.
+			waitFor(t, 5*time.Second, func() bool { return len(pub.published()) == n })
+			for i, m := range pub.published() {
+				if m.Payload[0] != byte(i) {
+					t.Fatalf("row %d delivered at position %d", m.Payload[0], i)
+				}
+			}
+		})
 	}
 }
 

@@ -266,7 +266,8 @@ NATS and Valkey dependencies never enter the core module's `go.mod`.
   rescheduled with backoff; after `WithMaxAttempts` it becomes `dead` and stays
   in the table for inspection.
 - **Ordering.** Best-effort by `created_at`. `WithOrdered(true)` enforces strict
-  per-`PartitionKey` ordering (creation time, then ID); a `dead` row blocks its
+  per-`PartitionKey` ordering (transaction time, then insertion order, so rows
+  written in one transaction keep their order); a `dead` row blocks its
   key until resolved or removed. Published/discarded rows do not block it.
 - **Latency.** A trigger fires `NOTIFY`; the relay wakes near-instantly and
   falls back to polling every `WithPollInterval`. Once awake it keeps claiming

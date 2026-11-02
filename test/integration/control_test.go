@@ -368,9 +368,11 @@ func TestMigrationUpgrade(t *testing.T) {
  ('old-processing','secret','processing',1,'old-worker',now()-interval '1 minute',now())`); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ { // migration is also safe for callers replaying Migrations() on startup
-		if _, err := conn.Exec(ctx, migrations[1]); err != nil {
-			t.Fatal(err)
+	for i := 0; i < 2; i++ { // migrations are also safe for callers replaying Migrations() on startup
+		for _, m := range migrations[1:] {
+			if _, err := conn.Exec(ctx, m); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	var kept bool
@@ -379,6 +381,14 @@ func TestMigrationUpgrade(t *testing.T) {
 	}
 	if !kept {
 		t.Fatal("upgrade lost legacy data or used creation time for dead retention")
+	}
+	var seqs, numbered int
+	if err := conn.QueryRow(ctx, `SELECT (SELECT count(*) FROM pg_sequences WHERE schemaname='upgrade'),
+ (SELECT count(DISTINCT seq) FROM outbox_messages)`).Scan(&seqs, &numbered); err != nil {
+		t.Fatal(err)
+	}
+	if seqs != 1 || numbered != 2 {
+		t.Fatalf("replayed upgrade left %d sequences and %d distinct seq values, want 1 and 2", seqs, numbered)
 	}
 	// Restore pooled connection state before returning it to the pool.
 	if _, err := conn.Exec(ctx, "SET search_path TO public"); err != nil {

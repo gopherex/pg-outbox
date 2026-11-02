@@ -87,7 +87,7 @@ func (s Store) claim(ctx context.Context, set config.Settings) ([]message.Messag
         SELECT 1 FROM %s e
         WHERE o.partition_key IS NOT NULL
           AND e.partition_key = o.partition_key
-          AND (e.created_at, e.id) < (o.created_at, o.id)
+          AND (e.created_at, e.seq) < (o.created_at, o.seq)
           AND e.status NOT IN ('published', 'discarded'))`, s.table)
 	}
 	q := fmt.Sprintf(`
@@ -101,7 +101,7 @@ WHERE id IN (
     SELECT o.id FROM %s o
     WHERE o.next_attempt_at <= now()
       AND (o.status = 'pending' OR (o.status = 'processing' AND o.locked_until < now()))%s
-    ORDER BY o.created_at, o.id
+    ORDER BY o.created_at, o.seq
     FOR UPDATE SKIP LOCKED
     LIMIT $3
 )
