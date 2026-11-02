@@ -44,7 +44,9 @@ func NewStore(exec, enq port.Executor, pool *pgxpool.Pool, schema string) Store 
 func (s Store) Table() string { return s.table }
 
 // Enqueue inserts messages using the transactional Executor, so the rows land in
-// the caller's business transaction.
+// the caller's business transaction. The ID is the dedupe key: a message whose
+// ID already exists (or repeats earlier in msgs) is skipped and the first row
+// kept, so a duplicate never aborts the caller's transaction.
 func (s Store) Enqueue(ctx context.Context, msgs []message.Message) error {
 	if len(msgs) == 0 {
 		return nil
@@ -74,6 +76,7 @@ func (s Store) Enqueue(ctx context.Context, msgs []message.Message) error {
 			nullStr(m.ID), m.Topic, nullStr(m.PartitionKey), m.Payload, string(hb),
 			nullStr(m.ContentType), nullStr(m.MessageType), nullInt(m.MaxAttempts))
 	}
+	b.WriteString(" ON CONFLICT (id) DO NOTHING")
 	_, err := s.enq.Exec(ctx, b.String(), args...)
 	return err
 }

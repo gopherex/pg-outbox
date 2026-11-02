@@ -277,6 +277,12 @@ NATS and Valkey dependencies never enter the core module's `go.mod`.
 
 - **At-least-once.** A failed batch is retried in full; consumers must
   deduplicate (e.g. on `Message.ID`).
+- **Idempotent enqueue.** `Message.ID` is the dedupe key while its row exists:
+  enqueuing an existing ID (in the same or another transaction, or twice in
+  one batch) is a no-op that keeps the first row and does not abort the
+  caller's transaction. Derive the ID from the change to dedupe repeated
+  triggers. Once the cleaner deletes a finished row, the same ID can be
+  enqueued again, so receivers still deduplicate.
 - **Scaling.** Run one relay per instance with a unique `WithInstanceID`.
   Claims use `FOR UPDATE SKIP LOCKED` + a lease (`locked_until`); a crashed
   instance's rows are re-claimed once its lease expires.

@@ -447,6 +447,76 @@ func TestEnqueueAtomicWithCallerTransaction(t *testing.T) {
 	}
 }
 
+// The message ID is the dedupe key: enqueuing an existing ID is a no-op that
+// keeps the first row and never aborts the caller's transaction.
+func TestEnqueueDuplicateIDKeepsFirst(t *testing.T) {
+	t.Parallel()
+	const id = "00000000-0000-0000-0000-00000000d00d"
+	first := outbox.Message{ID: id, Topic: "t", Payload: []byte("first")}
+	second := outbox.Message{ID: id, Topic: "t", Payload: []byte("second")}
+	inTx := func(ctx context.Context, pool *pgxpool.Pool, fn func(*outbox.Outbox) error) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		ob, err := outbox.New(pool, tx, nil)
+		if err != nil {
+			return err
+		}
+		if err := fn(ob); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "SELECT 1"); err != nil { // the transaction is still usable
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+	for _, tc := range []struct {
+		name    string
+		enqueue func(context.Context, *pgxpool.Pool) error
+	}{
+		{name: "twice in one transaction", enqueue: func(ctx context.Context, pool *pgxpool.Pool) error {
+			return inTx(ctx, pool, func(ob *outbox.Outbox) error {
+				if err := ob.Enqueue(ctx, first); err != nil {
+					return err
+				}
+				return ob.Enqueue(ctx, second)
+			})
+		}},
+		{name: "in two transactions", enqueue: func(ctx context.Context, pool *pgxpool.Pool) error {
+			for _, m := range []outbox.Message{first, second} {
+				if err := inTx(ctx, pool, func(ob *outbox.Outbox) error { return ob.Enqueue(ctx, m) }); err != nil {
+					return err
+				}
+			}
+			return nil
+		}},
+		{name: "duplicate inside one batch", enqueue: func(ctx context.Context, pool *pgxpool.Pool) error {
+			return inTx(ctx, pool, func(ob *outbox.Outbox) error {
+				return ob.EnqueueBatch(ctx, []outbox.Message{first, {Topic: "t", Payload: []byte("other")}, second})
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pool := newTestPool(t)
+			ctx := context.Background()
+			if err := tc.enqueue(ctx, pool); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			var rows int
+			var payload string
+			if err := pool.QueryRow(ctx, "SELECT count(*), min(convert_from(payload, 'UTF8')) FROM outbox_messages WHERE id=$1", id).Scan(&rows, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 1 || payload != "first" {
+				t.Fatalf("rows=%d payload=%q, want 1 row with the first payload", rows, payload)
+			}
+		})
+	}
+}
+
 // A per-message outcome settles only its own row; rows without an entry take
 // the batch-level outcome (nil: published, joining the published group).
 func TestPerMessageOutcomes(t *testing.T) {
