@@ -15,14 +15,16 @@ import (
 
 // Relay claims ready rows, publishes them, and records the outcome.
 type Relay struct {
-	store Store
-	pub   port.Publisher
-	set   config.Settings
+	store   Store
+	pub     port.Publisher
+	set     config.Settings
+	waiters *Waiters // receives DoneChannel notifications
 }
 
-// NewRelay builds a Relay.
-func NewRelay(s Store, pub port.Publisher, set config.Settings) *Relay {
-	return &Relay{store: s, pub: pub, set: set}
+// NewRelay builds a Relay. Its LISTEN connection also feeds done notifications
+// to waiters.
+func NewRelay(s Store, pub port.Publisher, set config.Settings, waiters *Waiters) *Relay {
+	return &Relay{store: s, pub: pub, set: set, waiters: waiters}
 }
 
 // processBatch claims one batch, publishes it, and records the outcome. It
@@ -337,12 +339,17 @@ func (r *Relay) listenOnce(ctx context.Context, wake chan<- struct{}) error {
 		return err
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel); err != nil {
+	if _, err := conn.Exec(ctx, "LISTEN "+NotifyChannel+"; LISTEN "+DoneChannel); err != nil {
 		return err
 	}
 	for {
-		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+		n, err := conn.Conn().WaitForNotification(ctx)
+		if err != nil {
 			return err
+		}
+		if n.Channel == DoneChannel {
+			r.waiters.Notify(n.Payload)
+			continue
 		}
 		select {
 		case wake <- struct{}{}:

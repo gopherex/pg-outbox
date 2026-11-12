@@ -15,7 +15,7 @@ import (
 
 // newTestPool starts a throwaway Postgres, applies the outbox migrations, and
 // returns a connected pool. The container is terminated via t.Cleanup.
-func newTestPool(t *testing.T) *pgxpool.Pool {
+func newTestPool(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 	ctr, err := postgres.Run(ctx, "postgres:16-alpine",

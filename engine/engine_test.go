@@ -16,11 +16,14 @@ import (
 )
 
 func TestNewStoreQualifiesTable(t *testing.T) {
-	s := NewStore(nil, nil, nil, "events")
+	s := NewStore(nil, nil, nil, "events", false)
 	if s.Table() != `"events".outbox_messages` {
 		t.Fatalf("table = %q, want \"events\".outbox_messages", s.Table())
 	}
 }
+
+// testWaiters is a registry for relays whose tests never wait.
+func testWaiters() *Waiters { return NewWaiters("public", newFake().read, time.Hour) }
 
 type mutatePublisher struct{}
 
@@ -32,7 +35,7 @@ func (mutatePublisher) Publish(_ context.Context, msgs []message.Message) error 
 }
 
 func TestPublisherCannotChangeClaimIdentity(t *testing.T) {
-	r := NewRelay(NewStore(nil, nil, nil, "public"), mutatePublisher{}, config.Resolve())
+	r := NewRelay(NewStore(nil, nil, nil, "public", false), mutatePublisher{}, config.Resolve(), testWaiters())
 	msgs := []message.Message{{ID: "claim-id", LeaseToken: "claim-token", Attempts: 1}}
 	if err, leaseErr := r.publish(context.Background(), msgs); err != nil || leaseErr != nil {
 		t.Fatalf("publish: %v, %v", err, leaseErr)
@@ -78,7 +81,7 @@ func TestRunStopsOnFatal(t *testing.T) {
 			set := config.Resolve(config.WithPollInterval(time.Millisecond), config.WithoutNotify(), config.WithConcurrency(3), config.WithFatal(tc.fatal))
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			err := NewRelay(NewStore(tc.exec, nil, nil, "public"), nil, set).Run(ctx)
+			err := NewRelay(NewStore(tc.exec, nil, nil, "public", false), nil, set, testWaiters()).Run(ctx)
 			if !errors.Is(err, errDB) || ctx.Err() != nil {
 				t.Fatalf("Run = %v (ctx %v), want fatal %v", err, ctx.Err(), errDB)
 			}
@@ -95,7 +98,7 @@ func TestRunIgnoresUnclassifiedErrors(t *testing.T) {
 	set := config.Resolve(config.WithPollInterval(time.Millisecond), config.WithoutNotify())
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := NewRelay(NewStore(failExec{err: errors.New("transient")}, nil, nil, "public"), nil, set).Run(ctx); err != nil {
+	if err := NewRelay(NewStore(failExec{err: errors.New("transient")}, nil, nil, "public", false), nil, set, testWaiters()).Run(ctx); err != nil {
 		t.Fatalf("Run = %v, want nil after cancellation", err)
 	}
 }
@@ -114,7 +117,7 @@ func TestCleanerStopsOnFatal(t *testing.T) {
 			t.Parallel()
 			set := config.Resolve(config.WithCleanupInterval(time.Millisecond), config.WithRetention(time.Hour),
 				config.WithFatal(func(err error) bool { return errors.Is(err, errDB) }))
-			err := NewCleaner(NewStore(tc.exec, nil, nil, "public"), set).Run(context.Background())
+			err := NewCleaner(NewStore(tc.exec, nil, nil, "public", false), set).Run(context.Background())
 			var panicked *port.PanicError
 			if !errors.Is(err, errDB) || errors.As(err, &panicked) != tc.exec.panics {
 				t.Fatalf("Run = %v", err)

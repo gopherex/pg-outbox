@@ -39,6 +39,7 @@ type Settings struct {
 	CleanupInterval        time.Duration
 	Ordered                bool
 	Notify                 bool
+	WaitRecheck            time.Duration
 	ListenPool             *pgxpool.Pool
 	Fatal                  func(error) bool
 	Hooks                  port.Hooks
@@ -57,6 +58,7 @@ func Default() Settings {
 		MaxAttempts:   10,
 		Backoff:       backoff.Default,
 		Notify:        true,
+		WaitRecheck:   time.Second,
 		Fatal:         neverFatal,
 		Hooks:         port.NoopHooks{},
 		Logger:        slog.New(slog.DiscardHandler), // no-op until the caller supplies one
@@ -81,6 +83,9 @@ func Resolve(opts ...Option) Settings {
 	}
 	if s.LeaseDuration <= 0 {
 		s.LeaseDuration = d.LeaseDuration
+	}
+	if s.WaitRecheck <= 0 {
+		s.WaitRecheck = d.WaitRecheck
 	}
 	if s.BatchSize < 1 {
 		s.BatchSize = d.BatchSize
@@ -143,6 +148,8 @@ type Config struct {
 	// DisableNotify turns LISTEN/NOTIFY off (poll-only). The zero value keeps
 	// NOTIFY enabled, so a hand-built Config does not silently disable it.
 	DisableNotify bool `mapstructure:"disable_notify"`
+	// WaitRecheck paces the shared state read behind WaitPublished.
+	WaitRecheck time.Duration `mapstructure:"wait_recheck" default:"1s"`
 }
 
 // Option configures Settings.
@@ -166,8 +173,15 @@ func WithConfig(c Config) Option {
 		s.CleanupInterval = c.CleanupInterval
 		s.Ordered = c.Ordered
 		s.Notify = !c.DisableNotify
+		s.WaitRecheck = c.WaitRecheck
 	}
 }
+
+// WithWaitRecheck sets how often WaitPublished re-reads row state when no
+// notification settled it (default 1s): one query per interval for all
+// waiting calls, covering a lost notification, a reconnecting listener, or a
+// process that does not Run this Outbox or has no LISTEN pool.
+func WithWaitRecheck(d time.Duration) Option { return func(s *Settings) { s.WaitRecheck = d } }
 
 // WithInstanceID sets the lease owner id (locked_by). Required before Run. Must
 // be unique and stable per process (e.g. the Kubernetes pod name).

@@ -253,6 +253,48 @@ and requeue in the same transaction. It preserves ID, creation time, and data;
 the next attempt receives a new lease token. Replaying a job can repeat an
 external side effect. The caller owns permission and eligibility checks.
 
+### Waiting for delivery
+
+A caller that must not answer before its own messages left the outbox (for
+example, a command whose effect other services must see first) asks by the
+`Message.ID`s it enqueued:
+
+```go
+done, err := ob.Published(ctx, ids...) // one read: true = all delivered
+err = ob.WaitPublished(ctx, ids...)    // blocks until delivered, undeliverable, or ctx ends
+```
+
+- **Delivered** means published, or no row at all (the cleaner removed a
+  finished row). An id that was never enqueued, and a dead row removed by
+  `WithDeadRetention`, read as delivered too.
+- A row that ended `dead` or `discarded` returns an error matching
+  `outbox.ErrUndelivered` (an `*outbox.UndeliveredError` naming the rows): it
+  will not be delivered unless requeued. A non-uuid id returns `ErrInvalidID`.
+- `WaitPublished` returns an error wrapping `ctx.Err()` (and the last failed
+  state read, if any) when `ctx` ends first.
+- Only the listed rows are read, by primary key, through the relay executor;
+  other rows and partitions never hold a wait.
+
+How `WaitPublished` learns the outcome:
+
+1. Every relay (in any process) announces rows reaching a terminal status on
+   the `outbox_messages_done` channel, from the statement that completes them,
+   so a listener receives it exactly at commit. The payload is
+   `<schema>:<status>:<id>,<id>,...`, at most 200 ids per notification.
+2. The LISTEN connection of this `Outbox`'s `Run` (the one that also wakes the
+   relay) feeds those notifications to the waiting calls: no query per wait
+   beyond its first check, made after it registered so no notification is
+   missed. Notifications for another schema are ignored.
+3. One shared re-read of all waiting ids every `WithWaitRecheck` interval
+   (default 1s, at most one query per interval however many calls wait)
+   settles what notifications did not: a listener reconnecting, a process that
+   does not `Run` this `Outbox` or has no LISTEN pool, or `WithoutNotify`.
+
+So wait on the `Outbox` whose `Run` is active in the same process for
+commit-time latency; elsewhere waits still finish, at the recheck pace. A relay
+running with `WithoutNotify` announces nothing, so waits on its rows also fall
+back to the recheck.
+
 ### Upgrade from v1.0
 
 Apply `0002_delivery_control.sql` before using the new relay. It adds claim

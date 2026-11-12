@@ -29,15 +29,42 @@ const messageColumns = `id, topic, partition_key, payload, headers, content_type
 // tx-bound); enqueue uses enq (joins the caller's business tx). pool is optional
 // and only LISTEN/NOTIFY needs it.
 type Store struct {
-	exec  port.Executor
-	enq   port.Executor
-	pool  *pgxpool.Pool
-	table string
+	exec   port.Executor
+	enq    port.Executor
+	pool   *pgxpool.Pool
+	schema string
+	table  string
+	// notifyDone makes finish announce terminal rows on DoneChannel.
+	notifyDone bool
 }
 
-// NewStore builds a Store. schema is assumed already validated.
-func NewStore(exec, enq port.Executor, pool *pgxpool.Pool, schema string) Store {
-	return Store{exec: exec, enq: enq, pool: pool, table: fmt.Sprintf("%q.%s", schema, message.TableName)}
+// NewStore builds a Store. schema is assumed already validated. notifyDone
+// announces rows reaching a terminal status on DoneChannel.
+func NewStore(exec, enq port.Executor, pool *pgxpool.Pool, schema string, notifyDone bool) Store {
+	return Store{exec: exec, enq: enq, pool: pool, schema: schema,
+		table: fmt.Sprintf("%q.%s", schema, message.TableName), notifyDone: notifyDone}
+}
+
+// DeliveryState returns the status of every listed row that exists and is not
+// published. ids must be canonical uuids; a row absent from the result is
+// delivered (published, or already removed by the cleaner). It reads through
+// the relay executor, never the caller's transaction, and only by primary key.
+func (s Store) DeliveryState(ctx context.Context, ids []string) (map[string]message.Status, error) {
+	rows, err := s.exec.Query(ctx, fmt.Sprintf(
+		`SELECT id::text, status FROM %s WHERE id = ANY($1::uuid[]) AND status <> 'published'`, s.table), ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]message.Status{}
+	for rows.Next() {
+		var id, st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return nil, err
+		}
+		out[id] = message.Status(st)
+	}
+	return out, rows.Err()
 }
 
 // Table returns the schema-qualified table identifier.
@@ -147,12 +174,18 @@ func (s Store) renew(ctx context.Context, msgs []message.Message, duration time.
 
 // finish changes only still-owned attempts. Returned rows are the committed
 // outcomes; hooks must never report success for a stale completion.
+//
+// A terminal status is announced on DoneChannel from the same statement, in
+// chunks of doneChunk ids, so it is delivered exactly when the change commits
+// and names only the rows this attempt really completed. The notify CTE is
+// joined into the result: PostgreSQL skips an unreferenced SELECT CTE.
 func (s Store) finish(ctx context.Context, msgs []message.Message, status message.Status, reason string, delay time.Duration, clear bool) ([]message.Message, error) {
 	if len(msgs) == 0 {
 		return nil, nil
 	}
 	ids, tokens := claimKeys(msgs)
-	rows, err := s.exec.Query(ctx, fmt.Sprintf(`UPDATE %s SET
+	notify := s.notifyDone && status != message.StatusPending
+	rows, err := s.exec.Query(ctx, fmt.Sprintf(`WITH done AS (UPDATE %s SET
  status=$3,
  next_attempt_at=CASE WHEN $3='pending' THEN clock_timestamp()+make_interval(secs => $5) ELSE next_attempt_at END,
  last_error=$4,
@@ -163,7 +196,15 @@ func (s Store) finish(ctx context.Context, msgs []message.Message, status messag
  locked_by=NULL, locked_until=NULL, lease_token=NULL
  WHERE (id, lease_token) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
  AND status='processing' AND locked_until > clock_timestamp()
- RETURNING %s`, s.table, messageColumns), ids, tokens, string(status), nullStr(reason), delay.Seconds(), clear)
+ RETURNING %[2]s
+), notified AS (
+ SELECT pg_notify('%[3]s', $7 || string_agg(id::text, ','))
+ FROM (SELECT id, (row_number() OVER () - 1) / %[4]d AS chunk FROM done) c
+ WHERE $8
+ GROUP BY chunk
+)
+SELECT %[2]s FROM done CROSS JOIN (SELECT count(*) FROM notified) n`, s.table, messageColumns, DoneChannel, doneChunk),
+		ids, tokens, string(status), nullStr(reason), delay.Seconds(), clear, donePrefix(s.schema, status), notify)
 	if err != nil {
 		return nil, err
 	}

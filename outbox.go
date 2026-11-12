@@ -17,6 +17,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"slices"
 
 	"github.com/gopherex/pg-outbox/backoff"
 	"github.com/gopherex/pg-outbox/config"
@@ -96,6 +97,7 @@ var (
 	WithCleanupInterval        = config.WithCleanupInterval
 	WithOrdered                = config.WithOrdered
 	WithoutNotify              = config.WithoutNotify
+	WithWaitRecheck            = config.WithWaitRecheck
 	WithListenPool             = config.WithListenPool
 	WithFatal                  = config.WithFatal
 	WithHooks                  = config.WithHooks
@@ -146,17 +148,26 @@ var (
 	ErrNoCodec = errors.New("outbox: no codec configured (use WithCodec)")
 	// ErrNoExecutor is returned by New when no relay Executor was supplied.
 	ErrNoExecutor = errors.New("outbox: a relay executor is required")
+	// ErrInvalidID is returned by Published / WaitPublished for a non-uuid id.
+	ErrInvalidID = engine.ErrInvalidID
+	// ErrUndelivered matches an *UndeliveredError through errors.Is.
+	ErrUndelivered = engine.ErrUndelivered
 )
+
+// UndeliveredError names the rows Published / WaitPublished found dead or
+// discarded; they will not be delivered unless requeued.
+type UndeliveredError = engine.UndeliveredError
 
 // ---- Facade -----------------------------------------------------------
 
 // Outbox is the public facade: enqueue messages (transactionally) and run the
 // background relay + cleaner.
 type Outbox struct {
-	store engine.Store
-	relay *engine.Relay
-	clean *engine.Cleaner
-	set   config.Settings
+	store   engine.Store
+	relay   *engine.Relay
+	clean   *engine.Cleaner
+	waiters *engine.Waiters
+	set     config.Settings
 }
 
 // New builds an Outbox.
@@ -190,13 +201,67 @@ func New(exec Executor, enq Executor, pub Publisher, opts ...Option) (*Outbox, e
 		}
 	}
 
-	st := engine.NewStore(exec, enq, listenPool, set.Schema)
+	st := engine.NewStore(exec, enq, listenPool, set.Schema, set.Notify)
+	waiters := engine.NewWaiters(set.Schema, st.DeliveryState, set.WaitRecheck)
 	return &Outbox{
-		store: st,
-		set:   set,
-		relay: engine.NewRelay(st, pub, set),
-		clean: engine.NewCleaner(st, set),
+		store:   st,
+		set:     set,
+		waiters: waiters,
+		relay:   engine.NewRelay(st, pub, set, waiters),
+		clean:   engine.NewCleaner(st, set),
 	}, nil
+}
+
+// Published reports whether every listed message is delivered: published, or
+// already removed by the cleaner. A row still pending or being published
+// makes it false. A row that ended dead or discarded returns an error matching
+// ErrUndelivered (an *UndeliveredError naming the rows): it will not be
+// delivered unless requeued. ids are the Message.IDs given to Enqueue; a
+// non-uuid id returns ErrInvalidID. It reads only those rows, by primary key,
+// through the relay executor (never a caller transaction), so other rows and
+// partitions do not affect it.
+//
+// An id with no row reads as delivered: that covers rows the cleaner removed,
+// but also an id never enqueued and a dead row removed by WithDeadRetention.
+func (o *Outbox) Published(ctx context.Context, ids ...string) (bool, error) {
+	canon, err := engine.CanonicalIDs(ids)
+	if err != nil || len(canon) == 0 {
+		return err == nil, err
+	}
+	states, err := o.store.DeliveryState(ctx, canon)
+	if err != nil {
+		return false, err
+	}
+	var undelivered []string
+	for id, st := range states {
+		if st == StatusDead || st == StatusDiscarded {
+			undelivered = append(undelivered, id)
+		}
+	}
+	if len(undelivered) > 0 {
+		slices.Sort(undelivered)
+		return false, &UndeliveredError{IDs: undelivered}
+	}
+	return len(states) == 0, nil
+}
+
+// WaitPublished blocks until every listed message is delivered (as Published
+// reports it), returning nil; or until one ends dead or discarded, returning
+// an error matching ErrUndelivered; or until ctx ends, returning an error that
+// wraps ctx.Err() (and the last failed state read, if any).
+//
+// It learns outcomes from the relays' commit notifications (DoneChannel),
+// whichever process published the rows, through the LISTEN connection of this
+// Outbox's Run: no query per wait beyond the first check. Without that
+// listener (Run not running here, no LISTEN pool, WithoutNotify) or for a
+// missed notification, one shared re-read for all waiting calls every
+// WithWaitRecheck interval settles it.
+func (o *Outbox) WaitPublished(ctx context.Context, ids ...string) error {
+	canon, err := engine.CanonicalIDs(ids)
+	if err != nil {
+		return err
+	}
+	return o.waiters.Wait(ctx, canon)
 }
 
 // Enqueue writes one message inside the caller's current transaction.
