@@ -257,7 +257,9 @@ external side effect. The caller owns permission and eligibility checks.
 
 `outbox.WithInstrumentation(i)` plugs telemetry into both ends of the outbox
 (default `NoopInstrumentation`). The core has no telemetry dependency; ready
-implementations live in `contrib/libs/*` modules.
+implementations live in `contrib/libs/*` modules:
+[`contrib/libs/xtrace`](contrib/libs/xtrace/README.md) traces each delivery as
+a new trace linked to the span that enqueued it.
 
 ```go
 type Instrumentation interface {
@@ -273,7 +275,7 @@ type Instrumentation interface {
 - `Deliver` runs in the relay for every claimed message before `Publish`. The
   context it returns is derived from the publish context (deadline and
   cancellation apply); a Publisher that sends messages one by one gets it with
-  `outbox.MessageContext(ctx, m)`.
+  `outbox.MessageContext(ctx, m)`. The built-in Valkey publishers do.
 - The returned end func is called exactly once per message with its
   `Outcome`: the committed status (`published`, `pending` for a scheduled
   retry, `dead`, `discarded`, per message under `PerMessage`), or
@@ -338,9 +340,11 @@ The Publisher, Hooks, and Executor interfaces remain source-compatible.
 
 The root package `outbox` is the core public surface (facade + re-exports). The
 implementation lives in subpackages: `message`, `port` (Publisher/Codec/Hooks/
-Executor), `config`, `backoff`, `migrations`, `engine` (store/relay/cleaner).
-Concrete publishers live in nested `contrib/publishers/*` modules so Kafka,
-NATS and Valkey dependencies never enter the core module's `go.mod`.
+Instrumentation/Executor), `config`, `backoff`, `migrations`, `engine`
+(store/relay/cleaner/waiters). Concrete publishers live in nested
+`contrib/publishers/*` modules and integrations with other libraries in
+`contrib/libs/*` (`xtrace`), so Kafka, NATS, Valkey and OpenTelemetry
+dependencies never enter the core module's `go.mod`.
 
 ## Semantics
 

@@ -89,7 +89,8 @@ func NewPubSub(client Client, opts ...PubSubOption) *PubSubPublisher {
 	return p
 }
 
-// Publish publishes every message to Message.Topic as a Valkey Pub/Sub channel.
+// Publish publishes every message to Message.Topic as a Valkey Pub/Sub channel,
+// each under its own delivery context (outbox.MessageContext).
 func (p *PubSubPublisher) Publish(ctx context.Context, msgs []outbox.Message) error {
 	for _, m := range msgs {
 		channel, payload, err := p.mapper(m)
@@ -97,7 +98,7 @@ func (p *PubSubPublisher) Publish(ctx context.Context, msgs []outbox.Message) er
 			return err
 		}
 		cmd := p.client.B().Publish().Channel(channel).Message(payload).Build()
-		if err := p.client.Do(ctx, cmd).Error(); err != nil {
+		if err := p.client.Do(outbox.MessageContext(ctx, m), cmd).Error(); err != nil {
 			return err
 		}
 	}
@@ -120,7 +121,8 @@ func NewStream(client Client, opts ...StreamOption) *StreamPublisher {
 	return p
 }
 
-// Publish XADDs every message to Message.Topic as a Valkey stream key.
+// Publish XADDs every message to Message.Topic as a Valkey stream key, each
+// under its own delivery context (outbox.MessageContext).
 func (p *StreamPublisher) Publish(ctx context.Context, msgs []outbox.Message) error {
 	for _, m := range msgs {
 		stream, fields, err := p.mapper(m)
@@ -131,7 +133,7 @@ func (p *StreamPublisher) Publish(ctx context.Context, msgs []outbox.Message) er
 		for _, field := range fields {
 			fv = fv.FieldValue(field.Name, field.Value)
 		}
-		if err := p.client.Do(ctx, fv.Build()).Error(); err != nil {
+		if err := p.client.Do(outbox.MessageContext(ctx, m), fv.Build()).Error(); err != nil {
 			return err
 		}
 	}
