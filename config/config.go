@@ -43,6 +43,7 @@ type Settings struct {
 	ListenPool             *pgxpool.Pool
 	Fatal                  func(error) bool
 	Hooks                  port.Hooks
+	Instrumentation        port.Instrumentation
 	Codec                  port.Codec
 	Logger                 *slog.Logger
 }
@@ -50,18 +51,19 @@ type Settings struct {
 // Default returns the baseline settings before any Option is applied.
 func Default() Settings {
 	return Settings{
-		Schema:        "public",
-		PollInterval:  time.Second,
-		BatchSize:     100,
-		LeaseDuration: 30 * time.Second,
-		Concurrency:   1,
-		MaxAttempts:   10,
-		Backoff:       backoff.Default,
-		Notify:        true,
-		WaitRecheck:   time.Second,
-		Fatal:         neverFatal,
-		Hooks:         port.NoopHooks{},
-		Logger:        slog.New(slog.DiscardHandler), // no-op until the caller supplies one
+		Schema:          "public",
+		PollInterval:    time.Second,
+		BatchSize:       100,
+		LeaseDuration:   30 * time.Second,
+		Concurrency:     1,
+		MaxAttempts:     10,
+		Backoff:         backoff.Default,
+		Notify:          true,
+		WaitRecheck:     time.Second,
+		Fatal:           neverFatal,
+		Hooks:           port.NoopHooks{},
+		Instrumentation: port.NoopInstrumentation{},
+		Logger:          slog.New(slog.DiscardHandler), // no-op until the caller supplies one
 	}
 }
 
@@ -104,6 +106,9 @@ func Resolve(opts ...Option) Settings {
 	}
 	if s.Hooks == nil {
 		s.Hooks = d.Hooks
+	}
+	if s.Instrumentation == nil {
+		s.Instrumentation = d.Instrumentation
 	}
 	if s.Logger == nil {
 		s.Logger = d.Logger
@@ -253,6 +258,16 @@ func WithHooks(h port.Hooks) Option {
 	return func(s *Settings) {
 		if h != nil {
 			s.Hooks = h
+		}
+	}
+}
+
+// WithInstrumentation plugs telemetry into Enqueue and delivery (default
+// NoopInstrumentation). See port.Instrumentation.
+func WithInstrumentation(i port.Instrumentation) Option {
+	return func(s *Settings) {
+		if i != nil {
+			s.Instrumentation = i
 		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"maps"
 	"slices"
 
 	"github.com/gopherex/pg-outbox/backoff"
@@ -49,6 +50,10 @@ type (
 	AbortError      = port.AbortError
 	BatchError      = port.BatchError
 	PanicError      = port.PanicError
+	// Instrumentation plugs telemetry into Enqueue and delivery.
+	Instrumentation     = port.Instrumentation
+	Outcome             = port.Outcome
+	NoopInstrumentation = port.NoopInstrumentation
 	// NoopHooks is the default no-op Hooks implementation.
 	NoopHooks = port.NoopHooks
 	// Executor is the pluggable pgx query surface (Exec, Query, QueryRow).
@@ -101,6 +106,7 @@ var (
 	WithListenPool             = config.WithListenPool
 	WithFatal                  = config.WithFatal
 	WithHooks                  = config.WithHooks
+	WithInstrumentation        = config.WithInstrumentation
 	WithCodec                  = config.WithCodec
 	WithLogger                 = config.WithLogger
 )
@@ -115,6 +121,11 @@ var (
 	PerMessage   = port.PerMessage
 	ErrLeaseLost = port.ErrLeaseLost
 )
+
+// MessageContext returns the context the Instrumentation opened for m's
+// delivery, or ctx when there is none. Publishers that send messages one by
+// one publish m with it.
+var MessageContext = port.MessageContext
 
 // ---- Re-exported backoff ----------------------------------------------
 
@@ -269,17 +280,34 @@ func (o *Outbox) Enqueue(ctx context.Context, m Message) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	return o.store.Enqueue(ctx, []Message{m})
+	return o.store.Enqueue(ctx, []Message{o.captured(ctx, m)})
 }
 
 // EnqueueBatch writes multiple messages inside the caller's current transaction.
 func (o *Outbox) EnqueueBatch(ctx context.Context, ms []Message) error {
-	for _, m := range ms {
+	out := make([]Message, len(ms))
+	for i, m := range ms {
 		if err := m.Validate(); err != nil {
 			return err
 		}
+		out[i] = o.captured(ctx, m)
 	}
-	return o.store.Enqueue(ctx, ms)
+	return o.store.Enqueue(ctx, out)
+}
+
+// captured returns m with the instrumentation's headers merged in. The
+// caller's headers map is never written, and its entries win.
+func (o *Outbox) captured(ctx context.Context, m Message) Message {
+	extra := map[string]string{}
+	o.set.Instrumentation.Capture(ctx, extra)
+	if len(extra) == 0 {
+		return m
+	}
+	headers := make(map[string]string, len(m.Headers)+len(extra))
+	maps.Copy(headers, extra)
+	maps.Copy(headers, m.Headers)
+	m.Headers = headers
+	return m
 }
 
 // EnqueueValue marshals v with the configured codec and enqueues it. Requires

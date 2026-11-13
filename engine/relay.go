@@ -27,10 +27,18 @@ func NewRelay(s Store, pub port.Publisher, set config.Settings, waiters *Waiters
 	return &Relay{store: s, pub: pub, set: set, waiters: waiters}
 }
 
+// outcomes records, per message id, the status each delivery committed.
+type outcomes map[string]port.Outcome
+
+// errDeliveryInterrupted is the outcome cause of a delivery whose batch ended
+// without a result for it (a panic unwound the relay).
+var errDeliveryInterrupted = errors.New("outbox: delivery interrupted")
+
 // processBatch claims one batch, publishes it, and records the outcome. It
 // returns the number of rows claimed (used by drain to decide whether to
-// continue).
-func (r *Relay) processBatch(ctx context.Context) (int, error) {
+// continue). Every claimed message gets one Instrumentation delivery, ended
+// with its committed outcome on every exit path.
+func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 	msgs, err := r.store.claim(ctx, r.set)
 	if err != nil {
 		return 0, err
@@ -39,7 +47,24 @@ func (r *Relay) processBatch(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	perr, leaseErr := r.publish(ctx, msgs)
+	rec := outcomes{}
+	var ends map[string]func(port.Outcome)
+	defer func() { endDeliveries(msgs, ends, rec, err) }()
+
+	pubCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if r.set.PublishTimeout > 0 {
+		var timeoutCancel context.CancelFunc
+		pubCtx, timeoutCancel = context.WithTimeout(pubCtx, r.set.PublishTimeout)
+		defer timeoutCancel()
+	}
+	byID := make(map[string]context.Context, len(msgs))
+	ends = make(map[string]func(port.Outcome), len(msgs))
+	for _, m := range msgs {
+		byID[m.ID], ends[m.ID] = r.set.Instrumentation.Deliver(pubCtx, m)
+	}
+
+	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, msgs)
 	if perr != nil && isFatal(ctx, r.set, perr) {
 		// The batch stays claimed: completion would retry or dead-letter it.
 		return len(msgs), fatalError{perr}
@@ -49,14 +74,37 @@ func (r *Relay) processBatch(ctx context.Context) (int, error) {
 	}
 	var batch *port.BatchError
 	if errors.As(perr, &batch) {
-		return len(msgs), r.settleEach(ctx, msgs, batch)
+		return len(msgs), r.settleEach(ctx, msgs, batch, rec)
 	}
-	return len(msgs), r.settle(ctx, msgs, perr)
+	return len(msgs), r.settle(ctx, msgs, perr, rec)
+}
+
+// endDeliveries ends every opened delivery once: with the status its row
+// committed, or as left claimed (processing) with the batch's error.
+func endDeliveries(msgs []message.Message, ends map[string]func(port.Outcome), rec outcomes, err error) {
+	var classified fatalError
+	if errors.As(err, &classified) {
+		err = classified.err
+	}
+	if err == nil {
+		err = errDeliveryInterrupted
+	}
+	for _, m := range msgs {
+		end := ends[m.ID]
+		if end == nil {
+			continue
+		}
+		o, ok := rec[m.ID]
+		if !ok {
+			o = port.Outcome{Status: message.StatusProcessing, Err: err}
+		}
+		end(o)
+	}
 }
 
 // settleEach settles every message by its own outcome. Published messages and
 // those taking the batch-level outcome are each settled as one group.
-func (r *Relay) settleEach(ctx context.Context, msgs []message.Message, batch *port.BatchError) error {
+func (r *Relay) settleEach(ctx context.Context, msgs []message.Message, batch *port.BatchError, rec outcomes) error {
 	var published, others []message.Message
 	var errs []error
 	for _, m := range msgs {
@@ -70,29 +118,29 @@ func (r *Relay) settleEach(ctx context.Context, msgs []message.Message, batch *p
 		case !ok:
 			others = append(others, m)
 		default:
-			errs = append(errs, r.settle(ctx, []message.Message{m}, outcome))
+			errs = append(errs, r.settle(ctx, []message.Message{m}, outcome, rec))
 		}
 	}
-	errs = append(errs, r.settle(ctx, published, nil), r.settle(ctx, others, batch.Err))
+	errs = append(errs, r.settle(ctx, published, nil, rec), r.settle(ctx, others, batch.Err, rec))
 	return errors.Join(errs...)
 }
 
 // settle records one publish outcome for every message in msgs.
-func (r *Relay) settle(ctx context.Context, msgs []message.Message, perr error) error {
+func (r *Relay) settle(ctx context.Context, msgs []message.Message, perr error, rec outcomes) error {
 	if len(msgs) == 0 {
 		return nil
 	}
 	if perr == nil {
-		return r.complete(ctx, msgs, message.StatusPublished, nil, 0)
+		return r.complete(ctx, msgs, message.StatusPublished, nil, 0, rec)
 	}
 	var permanent *port.PermanentError
 	var discarded *port.DiscardError
 	var retry *port.RetryAfterError
 	switch {
 	case errors.As(perr, &permanent):
-		return r.complete(ctx, msgs, message.StatusDead, perr, 0)
+		return r.complete(ctx, msgs, message.StatusDead, perr, 0, rec)
 	case errors.As(perr, &discarded):
-		return r.complete(ctx, msgs, message.StatusDiscarded, perr, 0)
+		return r.complete(ctx, msgs, message.StatusDiscarded, perr, 0, rec)
 	}
 	errors.As(perr, &retry)
 	// Attempt counts and per-message limits may differ inside one failed batch.
@@ -116,14 +164,16 @@ func (r *Relay) settle(ctx context.Context, msgs []message.Message, perr error) 
 				delay = retry.Delay
 			}
 		}
-		if err := r.complete(ctx, []message.Message{m}, status, perr, delay); err != nil {
+		if err := r.complete(ctx, []message.Message{m}, status, perr, delay, rec); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (r *Relay) complete(ctx context.Context, msgs []message.Message, status message.Status, cause error, delay time.Duration) error {
+// complete commits status for msgs and records it in rec for the rows it
+// actually changed (a row whose lease was lost is not recorded).
+func (r *Relay) complete(ctx context.Context, msgs []message.Message, status message.Status, cause error, delay time.Duration, rec outcomes) error {
 	reason := ""
 	if cause != nil {
 		reason = cause.Error()
@@ -131,6 +181,9 @@ func (r *Relay) complete(ctx context.Context, msgs []message.Message, status mes
 	completed, err := r.store.finish(ctx, msgs, status, reason, delay, r.set.ClearPayloadOnComplete)
 	if err != nil {
 		return err
+	}
+	for _, m := range completed {
+		rec[m.ID] = port.Outcome{Status: status, Err: cause}
 	}
 	if len(completed) > 0 {
 		switch status {
@@ -157,17 +210,11 @@ func (r *Relay) complete(ctx context.Context, msgs []message.Message, status mes
 }
 
 // publish renews claims while the adapter runs. Renewal failures cancel the
-// publisher context; they are not converted to transport failures. The lease
-// then expires for recovery. An adapter ignoring cancellation cannot be stopped
-// safely by the library, but its stale result cannot change a newer claim.
-func (r *Relay) publish(ctx context.Context, msgs []message.Message) (error, error) {
-	pubCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	if r.set.PublishTimeout > 0 {
-		var timeoutCancel context.CancelFunc
-		pubCtx, timeoutCancel = context.WithTimeout(pubCtx, r.set.PublishTimeout)
-		defer timeoutCancel()
-	}
+// publisher context (through cancel); they are not converted to transport
+// failures. The lease then expires for recovery. An adapter ignoring
+// cancellation cannot be stopped safely by the library, but its stale result
+// cannot change a newer claim. pubCtx already carries the publish deadline.
+func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, msgs []message.Message) (error, error) {
 	interval := r.set.LeaseDuration / 3
 	if interval <= 0 {
 		interval = time.Nanosecond

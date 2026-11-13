@@ -253,6 +253,33 @@ and requeue in the same transaction. It preserves ID, creation time, and data;
 the next attempt receives a new lease token. Replaying a job can repeat an
 external side effect. The caller owns permission and eligibility checks.
 
+### Instrumentation
+
+`outbox.WithInstrumentation(i)` plugs telemetry into both ends of the outbox
+(default `NoopInstrumentation`). The core has no telemetry dependency; ready
+implementations live in `contrib/libs/*` modules.
+
+```go
+type Instrumentation interface {
+    Capture(ctx context.Context, headers map[string]string)
+    Deliver(ctx context.Context, m Message) (context.Context, func(Outcome))
+}
+```
+
+- `Capture` runs at `Enqueue`, in the caller's context, before the insert. What
+  it writes into the fresh `headers` map is merged into the message headers
+  (stored in the row, sent to the transport); the caller's own entries win and
+  the caller's map is never written.
+- `Deliver` runs in the relay for every claimed message before `Publish`. The
+  context it returns is derived from the publish context (deadline and
+  cancellation apply); a Publisher that sends messages one by one gets it with
+  `outbox.MessageContext(ctx, m)`.
+- The returned end func is called exactly once per message with its
+  `Outcome`: the committed status (`published`, `pending` for a scheduled
+  retry, `dead`, `discarded`, per message under `PerMessage`), or
+  `processing` with the cause when the attempt left the row claimed (abort,
+  panic, lost lease, failed completion).
+
 ### Waiting for delivery
 
 A caller that must not answer before its own messages left the outbox (for

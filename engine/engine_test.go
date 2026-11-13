@@ -37,7 +37,9 @@ func (mutatePublisher) Publish(_ context.Context, msgs []message.Message) error 
 func TestPublisherCannotChangeClaimIdentity(t *testing.T) {
 	r := NewRelay(NewStore(nil, nil, nil, "public", false), mutatePublisher{}, config.Resolve(), testWaiters())
 	msgs := []message.Message{{ID: "claim-id", LeaseToken: "claim-token", Attempts: 1}}
-	if err, leaseErr := r.publish(context.Background(), msgs); err != nil || leaseErr != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err, leaseErr := r.publish(ctx, cancel, msgs); err != nil || leaseErr != nil {
 		t.Fatalf("publish: %v, %v", err, leaseErr)
 	}
 	if msgs[0].ID != "claim-id" || msgs[0].LeaseToken != "claim-token" || msgs[0].Attempts != 1 {
