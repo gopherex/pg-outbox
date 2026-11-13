@@ -21,8 +21,12 @@ ob, err := outbox.New(pool, enq, pub,
   producer) with a link to that origin, so the command's trace leads to its
   deliveries and every delivery is its own trace. Without an origin there is
   no link.
-- The publisher gets the delivery span with `outbox.MessageContext(ctx, m)`;
-  the built-in Valkey publishers send each message under it.
+- The delivery span reaches the transport two ways: the messages handed to
+  `Publish` carry its `traceparent` in `Headers` (so the NATS and Kafka
+  publishers put it into their message headers, and Valkey streams into
+  fields), and `outbox.MessageContext(ctx, m)` returns its context (the
+  Valkey publishers send each command under it). A consumer continuing from
+  those headers continues the delivery, which links back to the command.
 - Attributes are bounded: `messaging.destination.name` (topic),
   `outbox.attempt`, `outbox.outcome` (`published`, `pending`, `dead`,
   `discarded`, `processing`). A scheduled retry and a discard are expected

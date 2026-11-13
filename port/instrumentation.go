@@ -16,7 +16,10 @@ import (
 // Deliver runs in the relay for each claimed message just before Publish. It
 // returns the context to publish that message with (derived from ctx, so the
 // publish deadline and cancellation still apply) and an end func the relay
-// calls exactly once with the message's Outcome, on every exit path.
+// calls exactly once with the message's Outcome, on every exit path. The
+// relay then runs Capture on that context and lays the result over the
+// headers of the copy handed to Publish (these entries win; the stored row is
+// unchanged), so a transport mapping Message.Headers carries the delivery on.
 type Instrumentation interface {
 	Capture(ctx context.Context, headers map[string]string)
 	Deliver(ctx context.Context, m message.Message) (context.Context, func(Outcome))

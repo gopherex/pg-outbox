@@ -1,12 +1,49 @@
 package engine
 
 import (
+	"context"
 	"errors"
+	"maps"
 	"testing"
 
 	"github.com/gopherex/pg-outbox/message"
 	"github.com/gopherex/pg-outbox/port"
 )
+
+// headerInst captures a fixed set of headers.
+type headerInst struct {
+	port.NoopInstrumentation
+	extra map[string]string
+}
+
+func (h headerInst) Capture(_ context.Context, headers map[string]string) {
+	maps.Copy(headers, h.extra)
+}
+
+func TestWithDeliveryHeaders(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		extra map[string]string
+		want  map[string]string
+	}{
+		{name: "nothing captured keeps the headers", want: map[string]string{"traceparent": "origin", "k": "v"}},
+		{name: "delivery headers win over stored ones", extra: map[string]string{"traceparent": "delivery"},
+			want: map[string]string{"traceparent": "delivery", "k": "v"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			stored := map[string]string{"traceparent": "origin", "k": "v"}
+			got := withDeliveryHeaders(context.Background(), message.Message{Headers: stored}, headerInst{extra: tc.extra})
+			if !maps.Equal(got.Headers, tc.want) {
+				t.Fatalf("headers = %v, want %v", got.Headers, tc.want)
+			}
+			if stored["traceparent"] != "origin" {
+				t.Fatalf("stored headers were written: %v", stored)
+			}
+		})
+	}
+}
 
 func TestEndDeliveries(t *testing.T) {
 	t.Parallel()

@@ -27,6 +27,9 @@ func (r *recorder) Capture(ctx context.Context, headers map[string]string) {
 		headers["x-origin"] = v
 		headers["x-shared"] = "instrumentation"
 	}
+	if id, ok := ctx.Value(deliveryKey{}).(string); ok {
+		headers["x-delivery"] = id
+	}
 }
 
 func (r *recorder) Deliver(ctx context.Context, m outbox.Message) (context.Context, func(outbox.Outcome)) {
@@ -104,6 +107,9 @@ func TestInstrumentationDeliveries(t *testing.T) {
 			if _, ok := mctx.Deadline(); !ok {
 				ctxErrs = append(ctxErrs, errors.New("message context of "+m.Topic+" lost the publish deadline"))
 			}
+			if m.Headers["x-delivery"] != m.ID {
+				ctxErrs = append(ctxErrs, errors.New("headers of "+m.Topic+" do not carry its delivery"))
+			}
 			mu.Unlock()
 			switch m.Topic {
 			case "permanent":
@@ -146,6 +152,11 @@ func TestInstrumentationDeliveries(t *testing.T) {
 	defer mu.Unlock()
 	if len(ctxErrs) > 0 {
 		t.Fatal(errors.Join(ctxErrs...))
+	}
+	// The delivery headers go to the transport only, never into the row.
+	var stored int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_messages WHERE headers ? 'x-delivery'`).Scan(&stored); err != nil || stored != 0 {
+		t.Fatalf("%d rows store delivery headers (%v)", stored, err)
 	}
 }
 

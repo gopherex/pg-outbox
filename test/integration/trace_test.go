@@ -24,8 +24,12 @@ func TestTraceLinksDeliveryToCommand(t *testing.T) {
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 
 	published := make(chan trace.SpanContext, 1)
+	inHeaders := make(chan trace.SpanContext, 1)
 	pub := publisherFunc(func(ctx context.Context, ms []outbox.Message) error {
 		published <- trace.SpanContextFromContext(outbox.MessageContext(ctx, ms[0]))
+		// What a transport mapper copies into NATS/Kafka headers.
+		inHeaders <- trace.SpanContextFromContext(propagation.TraceContext{}.Extract(context.Background(),
+			propagation.MapCarrier(ms[0].Headers)))
 		return nil
 	})
 	ob, err := outbox.New(pool, pool, pub, outbox.WithPollInterval(10*time.Millisecond),
@@ -53,6 +57,9 @@ func TestTraceLinksDeliveryToCommand(t *testing.T) {
 	}
 	if !delivery.IsValid() || delivery.TraceID() == command.SpanContext().TraceID() {
 		t.Fatalf("publisher saw %v, want a delivery span in a new trace", delivery)
+	}
+	if h := <-inHeaders; h.SpanID() != delivery.SpanID() {
+		t.Fatalf("message headers carry span %v, want the delivery span %v", h.SpanID(), delivery.SpanID())
 	}
 	waitFor(t, 5*time.Second, func() bool { return len(exp.GetSpans()) == 2 })
 	for _, s := range exp.GetSpans() {

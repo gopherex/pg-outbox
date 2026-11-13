@@ -276,6 +276,11 @@ type Instrumentation interface {
   context it returns is derived from the publish context (deadline and
   cancellation apply); a Publisher that sends messages one by one gets it with
   `outbox.MessageContext(ctx, m)`. The built-in Valkey publishers do.
+- The messages handed to `Publish` also carry `Capture` of their delivery
+  context in `Headers` (over the stored entries; the row is not changed), so
+  every publisher that maps `Message.Headers` to the transport — NATS headers,
+  Kafka headers, Valkey stream fields — carries the delivery on to consumers
+  with no context API of its own.
 - The returned end func is called exactly once per message with its
   `Outcome`: the committed status (`published`, `pending` for a scheduled
   retry, `dead`, `discarded`, per message under `PerMessage`), or

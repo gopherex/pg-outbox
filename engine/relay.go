@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -60,11 +61,15 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 	}
 	byID := make(map[string]context.Context, len(msgs))
 	ends = make(map[string]func(port.Outcome), len(msgs))
-	for _, m := range msgs {
+	// Publishers get copies: adapters may modify what they receive, while the
+	// heartbeat and completion must keep the original claim tokens.
+	out := make([]message.Message, len(msgs))
+	for i, m := range msgs {
 		byID[m.ID], ends[m.ID] = r.set.Instrumentation.Deliver(pubCtx, m)
+		out[i] = withDeliveryHeaders(byID[m.ID], m, r.set.Instrumentation)
 	}
 
-	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, msgs)
+	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, msgs, out)
 	if perr != nil && isFatal(ctx, r.set, perr) {
 		// The batch stays claimed: completion would retry or dead-letter it.
 		return len(msgs), fatalError{perr}
@@ -77,6 +82,24 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 		return len(msgs), r.settleEach(ctx, msgs, batch, rec)
 	}
 	return len(msgs), r.settle(ctx, msgs, perr, rec)
+}
+
+// withDeliveryHeaders returns m with the delivery's own headers (Capture of
+// its delivery context) laid over the stored ones, so any transport that maps
+// Message.Headers (NATS, Kafka, stream fields) continues the delivery rather
+// than the origin; the origin stays reachable through the delivery's link.
+// The stored row is not changed.
+func withDeliveryHeaders(dctx context.Context, m message.Message, inst port.Instrumentation) message.Message {
+	extra := map[string]string{}
+	inst.Capture(dctx, extra)
+	if len(extra) == 0 {
+		return m
+	}
+	headers := make(map[string]string, len(m.Headers)+len(extra))
+	maps.Copy(headers, m.Headers)
+	maps.Copy(headers, extra)
+	m.Headers = headers
+	return m
 }
 
 // endDeliveries ends every opened delivery once: with the status its row
@@ -214,17 +237,17 @@ func (r *Relay) complete(ctx context.Context, msgs []message.Message, status mes
 // failures. The lease then expires for recovery. An adapter ignoring
 // cancellation cannot be stopped safely by the library, but its stale result
 // cannot change a newer claim. pubCtx already carries the publish deadline.
-func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, msgs []message.Message) (error, error) {
+// claims keep the claim identity for the heartbeat; out is what the adapter
+// receives (a private copy it may modify).
+func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, claims, out []message.Message) (error, error) {
 	interval := r.set.LeaseDuration / 3
 	if interval <= 0 {
 		interval = time.Nanosecond
 	}
 	stop := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- recovered(func() error { return r.heartbeat(pubCtx, cancel, stop, msgs, interval) }) }()
-	// Keep claim identity private: adapters may modify the slice they receive,
-	// while the heartbeat and completion must use the original claim tokens.
-	perr := r.pub.Publish(pubCtx, append([]message.Message(nil), msgs...))
+	go func() { done <- recovered(func() error { return r.heartbeat(pubCtx, cancel, stop, claims, interval) }) }()
+	perr := r.pub.Publish(pubCtx, out)
 	close(stop)
 	return perr, <-done
 }
