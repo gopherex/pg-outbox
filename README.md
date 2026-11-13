@@ -175,6 +175,43 @@ left claimed, and a `WithFatal` classifier sees the whole `*BatchError`
 (`errors.Is` / `errors.As` reach every entry). In ordered mode each failed head
 holds only its own key, exactly as with a whole-batch failure.
 
+### Settling messages early
+
+`Publish` returns once per batch, so by default every row of a batch stays
+`processing` until the slowest one is done, holding the next row of its
+partition, even rows of other partitions already delivered. A publisher that
+learns outcomes one by one (a JetStream ack per message) reports each as soon
+as it knows it:
+
+```go
+func (p *jsPublisher) Publish(ctx context.Context, msgs []outbox.Message) error {
+    for _, m := range msgs {
+        go func() {
+            _, err := p.js.PublishMsg(outbox.MessageContext(ctx, m), toNATS(m))
+            _ = outbox.Settle(ctx, m, err) // nil = published; outcomes as in PerMessage
+        }()
+    }
+    // ... wait for all acks
+    return nil
+}
+```
+
+The relay commits early outcomes right away, group-committed within
+`WithSettleLinger` (default 1ms) or until `Publish` returns, so a row stops
+holding its partition and another worker (`WithConcurrency` > 1) claims the
+partition's next row while the batch's slow rows still publish. Ordering per
+`PartitionKey` is unchanged. Rows a publisher does not settle take what
+`Publish` returns. Leases of the rows still in flight keep being renewed.
+
+- `Settle` outcomes are read like `PerMessage` entries; a fatal one (Abort,
+  or one `WithFatal` accepts) leaves that row claimed and stops the relay when
+  `Publish` returns, while rows settled before it stay committed.
+- Misuse is reported: `ErrNotSettling` outside a relay `Publish` call (or after
+  it returned), `ErrUnknownMessage` for a message not in the batch,
+  `ErrAlreadySettled` for a second report.
+- A publisher that settles every message costs about as many statements as a
+  batch return.
+
 ### Fatal stop and panics
 
 A fatal error stops the relay and the cleaner, and `Run` returns it to the

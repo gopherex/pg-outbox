@@ -64,10 +64,12 @@ func TestResolveAppliesOptions(t *testing.T) {
 		WithOrdered(true),
 		WithoutNotify(),
 		WithWaitRecheck(5*time.Second),
+		WithSettleLinger(2*time.Millisecond),
 	)
 	if s.InstanceID != "pod-1" || s.Schema != "events" || s.BatchSize != 50 ||
 		s.Concurrency != 4 || s.MaxAttempts != 7 || !s.Ordered || s.Notify ||
-		s.Retention != 24*time.Hour || s.CleanupInterval != time.Hour || s.WaitRecheck != 5*time.Second {
+		s.Retention != 24*time.Hour || s.CleanupInterval != time.Hour || s.WaitRecheck != 5*time.Second ||
+		s.SettleLinger != 2*time.Millisecond {
 		t.Fatalf("options not applied: %+v", s)
 	}
 }
@@ -83,10 +85,12 @@ func TestWithConfig(t *testing.T) {
 		Ordered:       true,
 		DisableNotify: true,
 		WaitRecheck:   3 * time.Second,
+		SettleLinger:  4 * time.Millisecond,
 	}
 	s := Resolve(WithConfig(c))
 	if s.Schema != "events" || s.BatchSize != 33 ||
-		s.Concurrency != 3 || s.MaxAttempts != 5 || !s.Ordered || s.Notify || s.WaitRecheck != 3*time.Second {
+		s.Concurrency != 3 || s.MaxAttempts != 5 || !s.Ordered || s.Notify || s.WaitRecheck != 3*time.Second ||
+		s.SettleLinger != 4*time.Millisecond {
 		t.Fatalf("WithConfig not applied: %+v", s)
 	}
 }
@@ -99,7 +103,7 @@ func TestWithConfigZeroValueIsSafe(t *testing.T) {
 	if s.Schema != d.Schema || s.PollInterval != d.PollInterval ||
 		s.LeaseDuration != d.LeaseDuration || s.BatchSize != d.BatchSize ||
 		s.Concurrency != d.Concurrency || s.MaxAttempts != d.MaxAttempts || !s.Notify ||
-		s.WaitRecheck != d.WaitRecheck {
+		s.WaitRecheck != d.WaitRecheck || s.SettleLinger != d.SettleLinger {
 		t.Fatalf("zero-value Config did not fall back to defaults: %+v", s)
 	}
 }
@@ -123,10 +127,11 @@ func TestResolveInstanceID(t *testing.T) {
 func TestResolveBoundsClamp(t *testing.T) {
 	d := Default()
 	s := Resolve(WithBatchSize(0), WithConcurrency(0), WithPollInterval(0),
-		WithLeaseDuration(0), WithMaxAttempts(0), WithSchema(""), WithWaitRecheck(0))
+		WithLeaseDuration(0), WithMaxAttempts(0), WithSchema(""), WithWaitRecheck(0), WithSettleLinger(0))
 	if s.BatchSize != d.BatchSize || s.Concurrency != d.Concurrency ||
 		s.PollInterval != d.PollInterval || s.LeaseDuration != d.LeaseDuration ||
-		s.MaxAttempts != d.MaxAttempts || s.Schema != d.Schema || s.WaitRecheck != d.WaitRecheck {
+		s.MaxAttempts != d.MaxAttempts || s.Schema != d.Schema || s.WaitRecheck != d.WaitRecheck ||
+		s.SettleLinger != d.SettleLinger {
 		t.Fatalf("bounds not clamped to defaults: %+v", s)
 	}
 }

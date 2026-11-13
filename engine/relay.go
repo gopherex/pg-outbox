@@ -59,6 +59,14 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 		pubCtx, timeoutCancel = context.WithTimeout(pubCtx, r.set.PublishTimeout)
 		defer timeoutCancel()
 	}
+	// Early outcomes (port.Settle) commit while the batch is still publishing.
+	// Closed before the deliveries end (defers run in reverse), since those
+	// read what it recorded.
+	st := newSettler(r, ctx, msgs, rec)
+	go st.run()
+	defer st.close()
+	pubCtx = port.WithSettler(pubCtx, st)
+
 	byID := make(map[string]context.Context, len(msgs))
 	ends = make(map[string]func(port.Outcome), len(msgs))
 	// Publishers get copies: adapters may modify what they receive, while the
@@ -69,19 +77,26 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 		out[i] = withDeliveryHeaders(byID[m.ID], m, r.set.Instrumentation)
 	}
 
-	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, msgs, out)
+	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, st, out)
+	st.close()
+	earlyFatal, earlyErr := st.result()
 	if perr != nil && isFatal(ctx, r.set, perr) {
 		// The batch stays claimed: completion would retry or dead-letter it.
 		return len(msgs), fatalError{perr}
 	}
-	if leaseErr != nil {
-		return len(msgs), leaseErr
+	if earlyFatal != nil {
+		return len(msgs), fatalError{earlyFatal}
 	}
+	if leaseErr != nil {
+		return len(msgs), errors.Join(leaseErr, earlyErr)
+	}
+	// Rows the publisher did not settle early take Publish's outcome.
+	rest := st.remaining(msgs)
 	var batch *port.BatchError
 	if errors.As(perr, &batch) {
-		return len(msgs), r.settleEach(ctx, msgs, batch, rec)
+		return len(msgs), errors.Join(earlyErr, r.settleEach(ctx, rest, batch, rec))
 	}
-	return len(msgs), r.settle(ctx, msgs, perr, rec)
+	return len(msgs), errors.Join(earlyErr, r.settle(ctx, rest, perr, rec))
 }
 
 // withDeliveryHeaders returns m with the delivery's own headers (Capture of
@@ -237,22 +252,22 @@ func (r *Relay) complete(ctx context.Context, msgs []message.Message, status mes
 // failures. The lease then expires for recovery. An adapter ignoring
 // cancellation cannot be stopped safely by the library, but its stale result
 // cannot change a newer claim. pubCtx already carries the publish deadline.
-// claims keep the claim identity for the heartbeat; out is what the adapter
-// receives (a private copy it may modify).
-func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, claims, out []message.Message) (error, error) {
+// st renews the leases of the rows still in flight (claim identity stays
+// private to it); out is what the adapter receives (a copy it may modify).
+func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, st *settler, out []message.Message) (error, error) {
 	interval := r.set.LeaseDuration / 3
 	if interval <= 0 {
 		interval = time.Nanosecond
 	}
 	stop := make(chan struct{})
 	done := make(chan error, 1)
-	go func() { done <- recovered(func() error { return r.heartbeat(pubCtx, cancel, stop, claims, interval) }) }()
+	go func() { done <- recovered(func() error { return r.heartbeat(pubCtx, cancel, stop, st, interval) }) }()
 	perr := r.pub.Publish(pubCtx, out)
 	close(stop)
 	return perr, <-done
 }
 
-func (r *Relay) heartbeat(ctx context.Context, cancel context.CancelFunc, stop <-chan struct{}, msgs []message.Message, interval time.Duration) error {
+func (r *Relay) heartbeat(ctx context.Context, cancel context.CancelFunc, stop <-chan struct{}, st *settler, interval time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -263,7 +278,7 @@ func (r *Relay) heartbeat(ctx context.Context, cancel context.CancelFunc, stop <
 			return nil
 		case <-ticker.C:
 			renewCtx, renewCancel := context.WithTimeout(ctx, interval)
-			err := r.store.renew(renewCtx, msgs, r.set.LeaseDuration)
+			err := st.renew(renewCtx, r.set.LeaseDuration)
 			renewCancel()
 			if err != nil {
 				// Cancellation of the call itself is not a lease renewal failure.

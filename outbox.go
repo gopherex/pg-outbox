@@ -103,6 +103,7 @@ var (
 	WithOrdered                = config.WithOrdered
 	WithoutNotify              = config.WithoutNotify
 	WithWaitRecheck            = config.WithWaitRecheck
+	WithSettleLinger           = config.WithSettleLinger
 	WithListenPool             = config.WithListenPool
 	WithFatal                  = config.WithFatal
 	WithHooks                  = config.WithHooks
@@ -126,6 +127,19 @@ var (
 // delivery, or ctx when there is none. Publishers that send messages one by
 // one publish m with it.
 var MessageContext = port.MessageContext
+
+// Settle reports one message's outcome from inside Publish as soon as it is
+// known, so the row stops holding its partition; see port.Settle.
+var Settle = port.Settle
+
+var (
+	// ErrNotSettling: Settle outside a relay Publish call or after it returned.
+	ErrNotSettling = port.ErrNotSettling
+	// ErrUnknownMessage: Settle for a message not in the batch.
+	ErrUnknownMessage = port.ErrUnknownMessage
+	// ErrAlreadySettled: a second Settle for the same message.
+	ErrAlreadySettled = port.ErrAlreadySettled
+)
 
 // ---- Re-exported backoff ----------------------------------------------
 

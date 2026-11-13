@@ -40,6 +40,7 @@ type Settings struct {
 	Ordered                bool
 	Notify                 bool
 	WaitRecheck            time.Duration
+	SettleLinger           time.Duration
 	ListenPool             *pgxpool.Pool
 	Fatal                  func(error) bool
 	Hooks                  port.Hooks
@@ -60,6 +61,7 @@ func Default() Settings {
 		Backoff:         backoff.Default,
 		Notify:          true,
 		WaitRecheck:     time.Second,
+		SettleLinger:    time.Millisecond,
 		Fatal:           neverFatal,
 		Hooks:           port.NoopHooks{},
 		Instrumentation: port.NoopInstrumentation{},
@@ -88,6 +90,9 @@ func Resolve(opts ...Option) Settings {
 	}
 	if s.WaitRecheck <= 0 {
 		s.WaitRecheck = d.WaitRecheck
+	}
+	if s.SettleLinger <= 0 {
+		s.SettleLinger = d.SettleLinger
 	}
 	if s.BatchSize < 1 {
 		s.BatchSize = d.BatchSize
@@ -155,6 +160,8 @@ type Config struct {
 	DisableNotify bool `mapstructure:"disable_notify"`
 	// WaitRecheck paces the shared state read behind WaitPublished.
 	WaitRecheck time.Duration `mapstructure:"wait_recheck" default:"1s"`
+	// SettleLinger is the group-commit window for early outcomes (Settle).
+	SettleLinger time.Duration `mapstructure:"settle_linger" default:"1ms"`
 }
 
 // Option configures Settings.
@@ -179,8 +186,15 @@ func WithConfig(c Config) Option {
 		s.Ordered = c.Ordered
 		s.Notify = !c.DisableNotify
 		s.WaitRecheck = c.WaitRecheck
+		s.SettleLinger = c.SettleLinger
 	}
 }
+
+// WithSettleLinger sets the group-commit window for outcomes reported early
+// with Settle (default 1ms): reports within it, or before Publish returns,
+// commit in one statement. It bounds how much later than its report a row is
+// released.
+func WithSettleLinger(d time.Duration) Option { return func(s *Settings) { s.SettleLinger = d } }
 
 // WithWaitRecheck sets how often WaitPublished re-reads row state when no
 // notification settled it (default 1s): one query per interval for all
