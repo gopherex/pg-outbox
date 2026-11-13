@@ -3,7 +3,7 @@ module github.com/gopherex/pg-outbox/contrib/libs/xtrace
 go 1.25.0
 
 require (
-	github.com/gopherex/pg-outbox v1.5.1
+	github.com/gopherex/pg-outbox v1.5.2
 	github.com/gopherex/xtrace v1.1.6
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
