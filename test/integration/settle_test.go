@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +94,75 @@ func TestSettleReleasesOtherPartitions(t *testing.T) {
 	}
 	if _, attempts := rowState(t, pool, a1); attempts != 1 {
 		t.Fatalf("A1 attempts = %d, want 1 (lease renewed, never reclaimed)", attempts)
+	}
+}
+
+// gatedPublisher holds partition A until gate closes and settles everything
+// else early, as a per-message-ack publisher would.
+func gatedPublisher(gate <-chan struct{}) publisherFunc {
+	return func(ctx context.Context, ms []outbox.Message) error {
+		var slow bool
+		for _, m := range ms {
+			if m.PartitionKey == "A" {
+				slow = true
+				continue
+			}
+			if err := outbox.Settle(ctx, m, nil); err != nil {
+				return err
+			}
+		}
+		if slow {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+}
+
+// A partition freed by an early Settle is claimed at once by an idle worker,
+// of the same relay or of another instance, not at the next poll (an hour
+// away here).
+func TestSettleWakesIdleWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		instances int
+		workers   int
+	}{
+		{name: "same relay", instances: 1, workers: 4},
+		{name: "another instance", instances: 2, workers: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			gate := make(chan struct{})
+			defer close(gate)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var obs []*outbox.Outbox
+			for i := range tc.instances {
+				ob, err := outbox.New(pool, pool, gatedPublisher(gate), outbox.WithOrdered(true),
+					outbox.WithInstanceID(fmt.Sprintf("i%d", i)), outbox.WithConcurrency(tc.workers),
+					outbox.WithBatchSize(100), outbox.WithPollInterval(time.Hour), outbox.WithWaitRecheck(time.Hour))
+				if err != nil {
+					t.Fatal(err)
+				}
+				obs = append(obs, ob)
+				go func() { _ = ob.Run(ctx) }()
+			}
+			time.Sleep(200 * time.Millisecond) // listeners up: the enqueue NOTIFY wakes the first claim
+			a1, b1, b2 := uid(1), uid(2), uid(3)
+			seedKeyed(t, pool, [2]string{a1, "A"}, [2]string{b1, "B"}, [2]string{b2, "B"})
+
+			waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer waitCancel()
+			start := time.Now()
+			if err := obs[0].WaitPublished(waitCtx, b1, b2); err != nil {
+				t.Fatalf("B2 not claimed after B1 settled: %v", err)
+			}
+			t.Logf("partition B delivered in %s", time.Since(start))
+		})
 	}
 }
 

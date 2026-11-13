@@ -200,7 +200,10 @@ The relay commits early outcomes right away, group-committed within
 `WithSettleLinger` (default 1ms) or until `Publish` returns, so a row stops
 holding its partition and another worker (`WithConcurrency` > 1) claims the
 partition's next row while the batch's slow rows still publish. Ordering per
-`PartitionKey` is unchanged. Rows a publisher does not settle take what
+`PartitionKey` is unchanged. In ordered mode a freed partition wakes an idle
+worker at once, not at the next poll: the relay's own workers on the commit,
+other instances through the commit's `outbox_messages_done` notification
+(LISTEN/NOTIFY enabled). Rows a publisher does not settle take what
 `Publish` returns. Leases of the rows still in flight keep being renewed.
 
 - `Settle` outcomes are read like `PerMessage` entries; a fatal one (Abort,

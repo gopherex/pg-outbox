@@ -137,10 +137,20 @@ func (s *settler) commit(batch []early) {
 	}
 	s.io.Lock()
 	err := s.relay.settleEach(s.ctx, msgs, &port.BatchError{Outcomes: outcomes}, s.rec)
+	released := false
 	for _, m := range msgs {
 		delete(s.inFlight, m.ID) // committed, or no longer ours (lease lost)
+		if o, ok := s.rec[m.ID]; ok && s.relay.releasesPartition(o.Status) {
+			released = true
+		}
 	}
 	s.io.Unlock()
+	// The partitions these rows held are free: let an idle worker claim their
+	// next rows now rather than at the next poll. (Other instances learn it
+	// from the commit's done notification.)
+	if released {
+		s.relay.wakeWorkers()
+	}
 	if err != nil {
 		s.mu.Lock()
 		s.errs = append(s.errs, err)

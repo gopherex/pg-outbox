@@ -20,6 +20,26 @@ type Relay struct {
 	pub     port.Publisher
 	set     config.Settings
 	waiters *Waiters // receives DoneChannel notifications
+	// wake signals idle workers (capacity 1, coalescing); set by Run before
+	// any worker starts, nil outside Run.
+	wake chan struct{}
+}
+
+// wakeWorkers nudges an idle worker to claim now; a pending nudge covers it.
+func (r *Relay) wakeWorkers() {
+	if r.wake == nil {
+		return
+	}
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// releasesPartition reports whether a row reaching status lets the next row
+// of its partition be claimed (ordered mode); dead and pending rows hold it.
+func (r *Relay) releasesPartition(status message.Status) bool {
+	return r.set.Ordered && (status == message.StatusPublished || status == message.StatusDiscarded)
 }
 
 // NewRelay builds a Relay. Its LISTEN connection also feeds done notifications
@@ -362,7 +382,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			once.Do(func() { failure = err; cancel() })
 		}
 	}
-	wake := make(chan struct{}, 1)
+	r.wake = make(chan struct{}, 1)
 	var wg sync.WaitGroup
 
 	// LISTEN/NOTIFY needs a dedicated pooled connection. Without a pool we run
@@ -371,7 +391,7 @@ func (r *Relay) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fail(recovered(func() error { r.listen(ctx, wake); return nil }))
+			fail(recovered(func() error { r.listen(ctx); return nil }))
 		}()
 	} else if r.set.Notify {
 		r.set.Logger.Warn("outbox: no listen pool configured, relay runs poll-only")
@@ -381,14 +401,14 @@ func (r *Relay) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fail(recovered(func() error { return r.worker(ctx, wake) }))
+			fail(recovered(func() error { return r.worker(ctx) }))
 		}()
 	}
 	wg.Wait()
 	return failure
 }
 
-func (r *Relay) worker(ctx context.Context, wake <-chan struct{}) error {
+func (r *Relay) worker(ctx context.Context) error {
 	ticker := time.NewTicker(r.set.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -396,7 +416,7 @@ func (r *Relay) worker(ctx context.Context, wake <-chan struct{}) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-		case <-wake:
+		case <-r.wake:
 		}
 		if err := r.drain(ctx); err != nil {
 			return err
@@ -404,11 +424,12 @@ func (r *Relay) worker(ctx context.Context, wake <-chan struct{}) error {
 	}
 }
 
-// listen holds a dedicated connection on LISTEN and signals wake on every
-// notification. It reconnects on error until ctx is cancelled.
-func (r *Relay) listen(ctx context.Context, wake chan<- struct{}) {
+// listen holds a dedicated connection on LISTEN and wakes a worker on every
+// enqueue notification and on every done notification that frees a
+// partition. It reconnects on error until ctx is cancelled.
+func (r *Relay) listen(ctx context.Context) {
 	for ctx.Err() == nil {
-		if err := r.listenOnce(ctx, wake); err != nil && ctx.Err() == nil {
+		if err := r.listenOnce(ctx); err != nil && ctx.Err() == nil {
 			r.set.Logger.Warn("outbox: listen connection lost, retrying", "err", err)
 			select {
 			case <-ctx.Done():
@@ -418,7 +439,7 @@ func (r *Relay) listen(ctx context.Context, wake chan<- struct{}) {
 	}
 }
 
-func (r *Relay) listenOnce(ctx context.Context, wake chan<- struct{}) error {
+func (r *Relay) listenOnce(ctx context.Context) error {
 	conn, err := r.store.pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -434,11 +455,13 @@ func (r *Relay) listenOnce(ctx context.Context, wake chan<- struct{}) error {
 		}
 		if n.Channel == DoneChannel {
 			r.waiters.Notify(n.Payload)
+			// Another relay (or this one) finished rows: in ordered mode
+			// their partitions' next rows are now claimable.
+			if schema, status, _, ok := parseDone(n.Payload); ok && schema == r.store.schema && r.releasesPartition(status) {
+				r.wakeWorkers()
+			}
 			continue
 		}
-		select {
-		case wake <- struct{}{}:
-		default: // a wake is already pending; coalesce
-		}
+		r.wakeWorkers()
 	}
 }
