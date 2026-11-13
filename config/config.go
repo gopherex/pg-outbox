@@ -41,6 +41,7 @@ type Settings struct {
 	Notify                 bool
 	WaitRecheck            time.Duration
 	SettleLinger           time.Duration
+	TombstoneRetention     time.Duration
 	ListenPool             *pgxpool.Pool
 	Fatal                  func(error) bool
 	Hooks                  port.Hooks
@@ -53,20 +54,21 @@ type Settings struct {
 // Default returns the baseline settings before any Option is applied.
 func Default() Settings {
 	return Settings{
-		Schema:          "public",
-		PollInterval:    time.Second,
-		BatchSize:       100,
-		LeaseDuration:   30 * time.Second,
-		Concurrency:     1,
-		MaxAttempts:     10,
-		Backoff:         backoff.Default,
-		Notify:          true,
-		WaitRecheck:     time.Second,
-		SettleLinger:    time.Millisecond,
-		Fatal:           neverFatal,
-		Hooks:           port.NoopHooks{},
-		Instrumentation: port.NoopInstrumentation{},
-		Logger:          slog.New(slog.DiscardHandler), // no-op until the caller supplies one
+		Schema:             "public",
+		PollInterval:       time.Second,
+		BatchSize:          100,
+		LeaseDuration:      30 * time.Second,
+		Concurrency:        1,
+		MaxAttempts:        10,
+		Backoff:            backoff.Default,
+		Notify:             true,
+		WaitRecheck:        time.Second,
+		SettleLinger:       time.Millisecond,
+		TombstoneRetention: 30 * 24 * time.Hour,
+		Fatal:              neverFatal,
+		Hooks:              port.NoopHooks{},
+		Instrumentation:    port.NoopInstrumentation{},
+		Logger:             slog.New(slog.DiscardHandler), // no-op until the caller supplies one
 	}
 }
 
@@ -94,6 +96,13 @@ func Resolve(opts ...Option) Settings {
 	}
 	if s.SettleLinger <= 0 {
 		s.SettleLinger = d.SettleLinger
+	}
+	if s.TombstoneRetention <= 0 {
+		s.TombstoneRetention = d.TombstoneRetention
+	}
+	// A retention without a cleaner would silently keep every row: run it.
+	if s.CleanupInterval <= 0 && (s.Retention > 0 || s.DeadRetention > 0 || s.DiscardRetention > 0) {
+		s.CleanupInterval = DefaultCleanupInterval
 	}
 	if s.BatchSize < 1 {
 		s.BatchSize = d.BatchSize
@@ -163,6 +172,8 @@ type Config struct {
 	WaitRecheck time.Duration `mapstructure:"wait_recheck" default:"1s"`
 	// SettleLinger is the group-commit window for early outcomes (Settle).
 	SettleLinger time.Duration `mapstructure:"settle_linger" default:"1ms"`
+	// TombstoneRetention keeps the outcome of removed dead/discarded rows.
+	TombstoneRetention time.Duration `mapstructure:"tombstone_retention" default:"720h"`
 }
 
 // Option configures Settings.
@@ -188,7 +199,16 @@ func WithConfig(c Config) Option {
 		s.Notify = !c.DisableNotify
 		s.WaitRecheck = c.WaitRecheck
 		s.SettleLinger = c.SettleLinger
+		s.TombstoneRetention = c.TombstoneRetention
 	}
+}
+
+// WithTombstoneRetention sets how long the outcome of a removed dead or
+// discarded row is kept (default 30 days): a compact id + status, no payload.
+// Within it Published/WaitPublished stay exact; see the outbox docs for the
+// horizon.
+func WithTombstoneRetention(d time.Duration) Option {
+	return func(s *Settings) { s.TombstoneRetention = d }
 }
 
 // WithSettleLinger sets the group-commit window for outcomes reported early
@@ -234,11 +254,15 @@ func WithRetryBackoff(b backoff.Backoff) Option {
 	}
 }
 
-// WithRetention enables cleanup of published rows older than ttl. The cleaner
-// also needs WithCleanupInterval to run.
+// WithRetention enables cleanup of published rows older than ttl.
 func WithRetention(ttl time.Duration) Option { return func(s *Settings) { s.Retention = ttl } }
 
-// WithCleanupInterval sets how often the cleaner runs (default off).
+// DefaultCleanupInterval is how often the cleaner runs when a retention is
+// set and no WithCleanupInterval is given.
+const DefaultCleanupInterval = time.Minute
+
+// WithCleanupInterval sets how often the cleaner runs (default
+// DefaultCleanupInterval once any retention is set; no retention, no cleaner).
 func WithCleanupInterval(d time.Duration) Option { return func(s *Settings) { s.CleanupInterval = d } }
 
 // WithOrdered enables strict per-partition_key ordering.
@@ -314,11 +338,11 @@ var schemaRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 func ValidSchema(s string) bool { return schemaRe.MatchString(s) }
 
 // WithDeadRetention enables deletion of dead rows after this terminal-state age.
-// Disabled by default. Requires WithCleanupInterval.
+// Disabled by default. Each removed row leaves a tombstone (WithTombstoneRetention).
 func WithDeadRetention(ttl time.Duration) Option { return func(s *Settings) { s.DeadRetention = ttl } }
 
 // WithDiscardRetention enables deletion of discarded rows after this age.
-// Disabled by default. Requires WithCleanupInterval.
+// Disabled by default. Each removed row leaves a tombstone (WithTombstoneRetention).
 func WithDiscardRetention(ttl time.Duration) Option {
 	return func(s *Settings) { s.DiscardRetention = ttl }
 }

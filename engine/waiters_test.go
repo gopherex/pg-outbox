@@ -168,7 +168,7 @@ func TestWaitersOutcomes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newFake(tc.pending...)
-			w := NewWaiters("public", f.read, time.Hour, false)
+			w := NewWaiters("public", f.read, time.Hour, GoneRule{})
 			res := waitAsync(t, w, f, t.Context(), idA, idB)
 			for _, p := range tc.notify {
 				w.Notify(p)
@@ -192,7 +192,7 @@ func TestWaitersOutcomes(t *testing.T) {
 func TestWaitersIgnoreForeignNotifications(t *testing.T) {
 	t.Parallel()
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, time.Hour, false)
+	w := NewWaiters("public", f.read, time.Hour, GoneRule{})
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	res := waitAsync(t, w, f, ctx, idA)
@@ -216,7 +216,7 @@ func TestWaitersRecheckIsShared(t *testing.T) {
 	const waiters = 50
 	interval := 20 * time.Millisecond
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, interval, false)
+	w := NewWaiters("public", f.read, interval, GoneRule{})
 	results := make([]<-chan error, waiters)
 	for i := range results {
 		results[i] = waitAsync(t, w, f, t.Context(), idA)
@@ -239,7 +239,7 @@ func TestWaitersTimeoutReportsReadFailure(t *testing.T) {
 	t.Parallel()
 	errDB := errors.New("db down")
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, 10*time.Millisecond, false)
+	w := NewWaiters("public", f.read, 10*time.Millisecond, GoneRule{})
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	res := waitAsync(t, w, f, ctx, idA)
@@ -256,7 +256,7 @@ func TestWaitersFirstReadFailure(t *testing.T) {
 	errDB := errors.New("db down")
 	f := newFake()
 	f.fail(errDB)
-	w := NewWaiters("public", f.read, time.Hour, false)
+	w := NewWaiters("public", f.read, time.Hour, GoneRule{})
 	if err := w.Wait(t.Context(), []string{idA}); !errors.Is(err, errDB) {
 		t.Fatalf("outcome = %v, want %v", err, errDB)
 	}
@@ -286,7 +286,7 @@ func TestVerdict(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			done, err := Verdict([]string{idA, idB}, tc.states, tc.collected)
+			done, err := Verdict([]string{idA, idB}, tc.states, ruleFor(tc.collected))
 			if done != tc.done || !errors.Is(err, tc.err) || (tc.err == nil) != (err == nil) {
 				t.Fatalf("Verdict = %v, %v; want %v, %v", done, err, tc.done, tc.err)
 			}
@@ -306,7 +306,7 @@ func TestVerdict(t *testing.T) {
 // outcome instead of a false success.
 func TestWaitersGoneRowOutcomeUnknown(t *testing.T) {
 	t.Parallel()
-	w := NewWaiters("public", newFake().read, time.Hour, true)
+	w := NewWaiters("public", newFake().read, time.Hour, ruleFor(true))
 	err := w.Wait(t.Context(), []string{idA})
 	var k *UnknownOutcomeError
 	if !errors.As(err, &k) || !slices.Equal(k.IDs, []string{idA}) {
@@ -319,7 +319,7 @@ func BenchmarkWaitersNotify(b *testing.B) {
 	for i := range ids {
 		ids[i] = fmt.Sprintf("0190a5f0-0000-7000-8000-%012d", i)
 	}
-	w := NewWaiters("public", newFake().read, time.Hour, false)
+	w := NewWaiters("public", newFake().read, time.Hour, GoneRule{})
 	for _, id := range ids[:10] {
 		w.register([]string{id})
 	}

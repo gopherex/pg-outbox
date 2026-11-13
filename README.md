@@ -275,7 +275,8 @@ outbox.WithClearPayloadOnComplete(true) // empty payload + headers on published/
 outbox.WithRetention(24*time.Hour)       // delete published rows
 outbox.WithDeadRetention(7*24*time.Hour) // delete dead rows
 outbox.WithDiscardRetention(time.Hour)  // delete discarded rows
-outbox.WithCleanupInterval(time.Minute)
+outbox.WithTombstoneRetention(30*24*time.Hour) // keep removed refusals' outcome (default)
+outbox.WithCleanupInterval(time.Minute) // optional: 1m by default once any retention is set
 ```
 
 All data-clearing/deletion policies are **opt-in**. Payload and headers are
@@ -287,7 +288,14 @@ SQL deletion/clearing does not erase historical WAL, backups, or caller logs.
 Dead/discarded retention starts at `finished_at`, published retention at
 `published_at`. Cleanup locks selected rows and skips locks, preventing it
 from deleting a concurrently requeued job. Pending/processing rows are never
-removed by the cleaner.
+removed by the cleaner. Each dead or discarded row it removes leaves a
+tombstone (id, status, finished_at) written in the same statement; the cleaner
+removes tombstones after `WithTombstoneRetention` (default 30 days), so all
+terminal state stays bounded (see Waiting for delivery).
+
+`WithClearPayloadOnComplete` deliberately leaves dead rows untouched: a dead
+row keeps its payload and headers for investigation and `Requeue`, until
+`WithDeadRetention` removes it.
 
 `ob.Requeue(ctx, id)` returns `(changed bool, err error)`. Only dead rows qualify;
 it resets attempts and terminal/lease state and emits a transactional wake-up.
@@ -343,12 +351,17 @@ done, err := ob.Published(ctx, ids...) // one read: true = all delivered
 err = ob.WaitPublished(ctx, ids...)    // blocks until delivered, undeliverable, or ctx ends
 ```
 
-- **Delivered** means published, or no row at all while the cleaner removes
-  no refused rows (no `WithDeadRetention` / `WithDiscardRetention`): then
-  only a published row can be gone. With either retention on, a gone row may
-  have been dead or discarded too, so it returns an error matching
-  `outbox.ErrOutcomeUnknown` (an `*outbox.UnknownOutcomeError` naming the rows)
-  instead of a false success. Give the `Outbox` that asks the same retention
+- **Delivered** means published. A dead or discarded row the cleaner removed
+  leaves a tombstone (`outbox_tombstones`: id, status, finished_at — no
+  payload) for `WithTombstoneRetention` (default 30 days), so its refusal is
+  still reported. An id with neither row nor tombstone is delivered when the
+  cleaner removes no refused rows (only a published row can be gone), or when
+  it is a UUIDv7 created within the horizon — shortest refusal retention +
+  tombstone retention − 1h for clock skew — since a refusal that recent would
+  still have its tombstone. Any other such id (older, or not a UUIDv7) returns
+  an error matching `outbox.ErrOutcomeUnknown` (an `*outbox.UnknownOutcomeError`
+  naming the rows), never a false success. Use UUIDv7 ids for exact answers
+  with bounded storage, and give the `Outbox` that asks the same retention
   options as the one that cleans. An id never enqueued reads as gone.
 - A row that ended `dead` or `discarded` returns an error matching
   `outbox.ErrUndelivered` (an `*outbox.UndeliveredError` naming the rows): it
@@ -377,6 +390,11 @@ So wait on the `Outbox` whose `Run` is active in the same process for
 commit-time latency; elsewhere waits still finish, at the recheck pace. A relay
 running with `WithoutNotify` announces nothing, so waits on its rows also fall
 back to the recheck.
+
+### Upgrade to v1.6
+
+Apply `0004_tombstones.sql` (additive: a new table) before running v1.6: the
+cleaner writes tombstones and `Published`/`WaitPublished` read them.
 
 ### Upgrade from v1.0
 

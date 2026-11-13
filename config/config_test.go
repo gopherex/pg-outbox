@@ -124,6 +124,32 @@ func TestResolveInstanceID(t *testing.T) {
 	}
 }
 
+// A retention never silently disables cleanup: without an explicit interval
+// the cleaner runs at DefaultCleanupInterval; with no retention it stays off.
+func TestCleanupIntervalFollowsRetention(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want time.Duration
+	}{
+		{name: "no retention", want: 0},
+		{name: "published retention", opts: []Option{WithRetention(time.Hour)}, want: DefaultCleanupInterval},
+		{name: "dead retention", opts: []Option{WithDeadRetention(time.Hour)}, want: DefaultCleanupInterval},
+		{name: "discard retention", opts: []Option{WithDiscardRetention(time.Hour)}, want: DefaultCleanupInterval},
+		{name: "explicit interval wins", opts: []Option{WithRetention(time.Hour), WithCleanupInterval(5 * time.Minute)},
+			want: 5 * time.Minute},
+		{name: "declarative config", opts: []Option{WithConfig(Config{Retention: time.Hour})}, want: DefaultCleanupInterval},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := Resolve(tc.opts...).CleanupInterval; got != tc.want {
+				t.Fatalf("CleanupInterval = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveBoundsClamp(t *testing.T) {
 	d := Default()
 	s := Resolve(WithBatchSize(0), WithConcurrency(0), WithPollInterval(0),

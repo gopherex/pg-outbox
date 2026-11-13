@@ -139,6 +139,79 @@ func TestPublishedWithRefusalsCollected(t *testing.T) {
 	}
 }
 
+// v7Now builds a UUIDv7 created now (n tells rows apart).
+func v7Now(n int) string {
+	ms := uint64(time.Now().UnixMilli())
+	return fmt.Sprintf("%08x-%04x-7000-8000-%012d", ms>>16, ms&0xffff, n)
+}
+
+// The cleaner removes refused rows but keeps their outcome: answers stay exact
+// within the tombstone horizon, and once tombstones expire too, unknown.
+func TestTombstonesKeepRefusals(t *testing.T) {
+	pool := newTestPool(t)
+	dead, discarded, published := v7Now(1), v7Now(2), v7Now(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	refused := errors.New("refused")
+	pub := publisherFunc(func(_ context.Context, ms []outbox.Message) error {
+		return outbox.PerMessage(map[string]error{dead: outbox.Permanent(refused), discarded: outbox.Discard(refused)}, nil)
+	})
+	retention := []outbox.Option{outbox.WithRetention(time.Millisecond), outbox.WithDeadRetention(time.Millisecond),
+		outbox.WithDiscardRetention(time.Millisecond), outbox.WithCleanupInterval(20 * time.Millisecond)}
+	ob, err := outbox.New(pool, pool, pub, append(retention, outbox.WithBatchSize(10),
+		outbox.WithPollInterval(10*time.Millisecond))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{dead, discarded, published} {
+		if err := ob.Enqueue(ctx, outbox.Message{ID: id, Topic: "t", Payload: []byte("payload")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runCtx, stop := context.WithCancel(ctx)
+	go func() { _ = ob.Run(runCtx) }()
+	waitFor(t, 10*time.Second, func() bool {
+		var rows int
+		return pool.QueryRow(ctx, `SELECT count(*) FROM outbox_messages`).Scan(&rows) == nil && rows == 0
+	})
+	stop()
+
+	var tombs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox_tombstones WHERE id = ANY($1::uuid[])`,
+		[]string{dead, discarded}).Scan(&tombs); err != nil || tombs != 2 {
+		t.Fatalf("tombstones = %d, %v; want the dead and the discarded row", tombs, err)
+	}
+	var undelivered *outbox.UndeliveredError
+	if _, err := ob.Published(ctx, dead, discarded); !errors.As(err, &undelivered) || len(undelivered.IDs) != 2 {
+		t.Fatalf("removed refusals: %v, want ErrUndelivered for both", err)
+	}
+	if done, err := ob.Published(ctx, published); !done || err != nil {
+		t.Fatalf("removed published v7 row: %v, %v; want delivered", done, err)
+	}
+	if err := ob.WaitPublished(ctx, published); err != nil {
+		t.Fatalf("wait on the removed published row: %v", err)
+	}
+	if _, err := ob.Published(ctx, uid(9)); !errors.Is(err, outbox.ErrOutcomeUnknown) {
+		t.Fatalf("gone v7 id past the horizon: %v, want ErrOutcomeUnknown", err)
+	}
+
+	// Tombstones expire: no false success afterwards, the answer is unknown.
+	expired, err := outbox.New(pool, pool, nil, append(retention, outbox.WithTombstoneRetention(time.Millisecond))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanCtx, stopClean := context.WithCancel(ctx)
+	go func() { _ = expired.Run(cleanCtx) }()
+	waitFor(t, 10*time.Second, func() bool {
+		var rows int
+		return pool.QueryRow(ctx, `SELECT count(*) FROM outbox_tombstones`).Scan(&rows) == nil && rows == 0
+	})
+	stopClean()
+	if _, err := expired.Published(ctx, dead); !errors.Is(err, outbox.ErrOutcomeUnknown) {
+		t.Fatalf("refusal whose tombstone expired: %v, want ErrOutcomeUnknown", err)
+	}
+}
+
 // The wait is settled by the relay's commit notification: the recheck is an
 // hour away, so nothing else could end it. A key stuck behind a failing
 // publish does not hold it.

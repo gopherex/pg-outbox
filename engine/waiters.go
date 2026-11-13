@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gopherex/pg-outbox/config"
 	"github.com/gopherex/pg-outbox/message"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -63,30 +64,88 @@ func (e *UnknownOutcomeError) Error() string {
 // Is makes errors.Is(err, ErrOutcomeUnknown) true.
 func (e *UnknownOutcomeError) Is(target error) bool { return target == ErrOutcomeUnknown }
 
-// statusGone marks a row the read did not find.
+// statusGone marks an id with neither a row nor a tombstone.
 const statusGone message.Status = "gone"
 
-// settled reads one row's state: delivered, failed (dead/discarded), unknown
-// (gone while refused rows are collected too), or still in flight (none).
-// A gone row is delivered only when the cleaner never removes refused rows:
-// then only a published row can have been removed.
-func settled(st message.Status, refusalsCollected bool) (delivered, failed, unknown bool) {
+// goneSafetyMargin trims the tombstone horizon for clock skew between the
+// application that made a UUIDv7 and the database that timed its outcome.
+const goneSafetyMargin = time.Hour
+
+// GoneRule decides what an id with neither a row nor a tombstone means.
+//
+// When the cleaner never removes refused rows, only a published row can be
+// gone: delivered. When it does, a removed refusal leaves a tombstone kept for
+// TombstoneRetention, so for a refusal to have left no trace it must have
+// finished more than (refusal retention + tombstone retention) ago. A UUIDv7
+// id carries its creation time, and a message created after that horizon
+// cannot be such a refusal: delivered, exactly. Any other gone id (older, or
+// not a UUIDv7) is unknown.
+type GoneRule struct {
+	refusalsCollected bool
+	window            time.Duration // ids created within it are exact; <= 0: none
+	now               func() time.Time
+}
+
+// NewGoneRule derives the rule from the outbox settings.
+func NewGoneRule(set config.Settings) GoneRule { return newGoneRule(set, time.Now) }
+
+func newGoneRule(set config.Settings, now func() time.Time) GoneRule {
+	var refusal time.Duration
+	for _, r := range []time.Duration{set.DeadRetention, set.DiscardRetention} {
+		if r > 0 && (refusal == 0 || r < refusal) {
+			refusal = r
+		}
+	}
+	if refusal == 0 {
+		return GoneRule{now: now}
+	}
+	return GoneRule{refusalsCollected: true, window: refusal + set.TombstoneRetention - goneSafetyMargin, now: now}
+}
+
+// delivered reports whether gone id is certainly delivered; false means its
+// outcome is unknown.
+func (g GoneRule) delivered(id string) bool {
+	if !g.refusalsCollected {
+		return true
+	}
+	created, ok := uuidV7Time(id)
+	return ok && g.window > 0 && created.After(g.now().Add(-g.window))
+}
+
+// uuidV7Time returns the creation time a UUIDv7 carries (its first 48 bits,
+// Unix milliseconds); ok is false for any other id.
+func uuidV7Time(id string) (time.Time, bool) {
+	var u pgtype.UUID
+	if err := u.Scan(id); err != nil || u.Bytes[6]>>4 != 7 {
+		return time.Time{}, false
+	}
+	var ms int64
+	for _, b := range u.Bytes[:6] {
+		ms = ms<<8 | int64(b)
+	}
+	return time.UnixMilli(ms), true
+}
+
+// settled reads one id's state: delivered, failed (dead/discarded, from the
+// row or its tombstone), unknown (gone, see GoneRule), or still in flight.
+func settled(id string, st message.Status, rule GoneRule) (delivered, failed, unknown bool) {
 	switch st {
 	case message.StatusPublished:
 		return true, false, false
 	case message.StatusDead, message.StatusDiscarded:
 		return false, true, false
 	case statusGone:
-		return !refusalsCollected, false, refusalsCollected
+		d := rule.delivered(id)
+		return d, false, !d
 	}
 	return false, false, false
 }
 
 // Verdict decides a delivery query over ids from a state read: done when every
-// row is delivered; an UndeliveredError when any ended dead or discarded
+// id is delivered; an UndeliveredError when any ended dead or discarded
 // (first, it is certain); an UnknownOutcomeError when any is gone and its
 // outcome cannot be known; otherwise not done yet.
-func Verdict(ids []string, states map[string]message.Status, refusalsCollected bool) (bool, error) {
+func Verdict(ids []string, states map[string]message.Status, rule GoneRule) (bool, error) {
 	var failed, unknown []string
 	pending := false
 	for _, id := range ids {
@@ -94,7 +153,7 @@ func Verdict(ids []string, states map[string]message.Status, refusalsCollected b
 		if !found {
 			st = statusGone
 		}
-		d, f, u := settled(st, refusalsCollected)
+		d, f, u := settled(id, st, rule)
 		switch {
 		case f:
 			failed = append(failed, id)
@@ -167,9 +226,7 @@ type Waiters struct {
 	schema   string
 	read     stateReader
 	interval time.Duration
-	// refusalsCollected: the cleaner removes dead/discarded rows, so a gone
-	// row's outcome is unknown (see settled).
-	refusalsCollected bool
+	gone     GoneRule // what an id with neither a row nor a tombstone means
 
 	mu        sync.Mutex
 	byID      map[string][]*waiter
@@ -187,11 +244,9 @@ type waiter struct {
 }
 
 // NewWaiters builds the waiter registry for one schema. interval paces the
-// shared recheck; refusalsCollected tells whether the cleaner removes dead or
-// discarded rows (see settled).
-func NewWaiters(schema string, read stateReader, interval time.Duration, refusalsCollected bool) *Waiters {
-	return &Waiters{schema: schema, read: read, interval: interval, refusalsCollected: refusalsCollected,
-		byID: map[string][]*waiter{}}
+// shared recheck; gone decides what an id with no trace means.
+func NewWaiters(schema string, read stateReader, interval time.Duration, gone GoneRule) *Waiters {
+	return &Waiters{schema: schema, read: read, interval: interval, gone: gone, byID: map[string][]*waiter{}}
 }
 
 // Wait blocks until every id is delivered, one ends undelivered, or ctx ends.
@@ -300,7 +355,7 @@ func (w *Waiters) apply(checked []string, states map[string]message.Status) {
 // settleLocked moves every waiter of id forward by status. Statuses still in
 // flight change nothing.
 func (w *Waiters) settleLocked(id string, status message.Status) {
-	delivered, failed, unknown := settled(status, w.refusalsCollected)
+	delivered, failed, unknown := settled(id, status, w.gone)
 	if !delivered && !failed && !unknown {
 		return
 	}

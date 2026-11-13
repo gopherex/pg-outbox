@@ -11,6 +11,10 @@ import (
 // embedded migration.
 const TableName = "outbox_messages"
 
+// TombstoneTableName holds the compact outcomes of removed dead/discarded rows
+// (same schema as TableName).
+const TombstoneTableName = "outbox_tombstones"
+
 var (
 	// ErrEmptyTopic is returned when a message has no topic.
 	ErrEmptyTopic = errors.New("outbox: message topic is empty")

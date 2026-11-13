@@ -23,7 +23,7 @@ func TestNewStoreQualifiesTable(t *testing.T) {
 }
 
 // testWaiters is a registry for relays whose tests never wait.
-func testWaiters() *Waiters { return NewWaiters("public", newFake().read, time.Hour, false) }
+func testWaiters() *Waiters { return NewWaiters("public", newFake().read, time.Hour, GoneRule{}) }
 
 type mutatePublisher struct{}
 
@@ -70,7 +70,12 @@ func (e failExec) Exec(context.Context, string, ...any) (pgconn.CommandTag, erro
 	return pgconn.CommandTag{}, e.fail()
 }
 func (e failExec) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, e.fail() }
-func (e failExec) QueryRow(context.Context, string, ...any) pgx.Row        { return nil }
+func (e failExec) QueryRow(context.Context, string, ...any) pgx.Row        { return failRow{e} }
+
+// failRow is the row of a failExec query: Scan fails the same way.
+type failRow struct{ exec failExec }
+
+func (r failRow) Scan(...any) error { return r.exec.fail() }
 
 func TestRunStopsOnFatal(t *testing.T) {
 	t.Parallel()

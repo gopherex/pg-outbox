@@ -29,11 +29,12 @@ const messageColumns = `id, topic, partition_key, payload, headers, content_type
 // tx-bound); enqueue uses enq (joins the caller's business tx). pool is optional
 // and only LISTEN/NOTIFY needs it.
 type Store struct {
-	exec   port.Executor
-	enq    port.Executor
-	pool   *pgxpool.Pool
-	schema string
-	table  string
+	exec       port.Executor
+	enq        port.Executor
+	pool       *pgxpool.Pool
+	schema     string
+	table      string
+	tombstones string
 	// notifyDone makes finish announce terminal rows on DoneChannel.
 	notifyDone bool
 }
@@ -42,16 +43,21 @@ type Store struct {
 // announces rows reaching a terminal status on DoneChannel.
 func NewStore(exec, enq port.Executor, pool *pgxpool.Pool, schema string, notifyDone bool) Store {
 	return Store{exec: exec, enq: enq, pool: pool, schema: schema,
-		table: fmt.Sprintf("%q.%s", schema, message.TableName), notifyDone: notifyDone}
+		table:      fmt.Sprintf("%q.%s", schema, message.TableName),
+		tombstones: fmt.Sprintf("%q.%s", schema, message.TombstoneTableName), notifyDone: notifyDone}
 }
 
-// DeliveryState returns the status of every listed row that exists. ids must
-// be canonical uuids; what an absent row means is Verdict's call. It reads
-// through the relay executor, never the caller's transaction, and only by
-// primary key.
+// DeliveryState returns the status of every listed row that exists, or, for
+// a removed dead/discarded row, its tombstone's status (a live row wins).
+// ids must be canonical uuids; what a gone id means is Verdict's call. It
+// reads through the relay executor, never the caller's transaction, and only
+// by primary key.
 func (s Store) DeliveryState(ctx context.Context, ids []string) (map[string]message.Status, error) {
-	rows, err := s.exec.Query(ctx, fmt.Sprintf(
-		`SELECT id::text, status FROM %s WHERE id = ANY($1::uuid[])`, s.table), ids)
+	rows, err := s.exec.Query(ctx, fmt.Sprintf(`SELECT DISTINCT ON (id) id::text, status FROM (
+ SELECT id, status, 0 AS rank FROM %s WHERE id = ANY($1::uuid[])
+ UNION ALL
+ SELECT id, status, 1 FROM %s WHERE id = ANY($1::uuid[])
+) states ORDER BY id, rank`, s.table, s.tombstones), ids)
 	if err != nil {
 		return nil, err
 	}
@@ -229,19 +235,39 @@ func (s Store) Requeue(ctx context.Context, id string) (bool, error) {
 
 // cleanup locks candidates so a concurrent replay cannot turn one into a
 // pending row between selection and deletion. Each retention is opt-in.
+//
+// A removed dead or discarded row leaves a tombstone (id, status,
+// finished_at) from the same statement, so its outcome stays known; expired
+// tombstones (TombstoneRetention) are removed after. It returns the removed
+// rows, tombstones not counted.
 func (s Store) cleanup(ctx context.Context, set config.Settings) (int64, error) {
-	tag, err := s.exec.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id IN (
- SELECT id FROM %s WHERE
+	var removed int64
+	if err := s.exec.QueryRow(ctx, fmt.Sprintf(`WITH removed AS (
+ DELETE FROM %[1]s WHERE id IN (
+ SELECT id FROM %[1]s WHERE
  ($1::double precision > 0 AND status='published' AND published_at < now()-make_interval(secs => $1)) OR
  ($2::double precision > 0 AND status='dead' AND finished_at < now()-make_interval(secs => $2)) OR
  ($3::double precision > 0 AND status='discarded' AND finished_at < now()-make_interval(secs => $3))
  ORDER BY COALESCE(finished_at, published_at), id
  LIMIT $4 FOR UPDATE SKIP LOCKED
- )`, s.table, s.table), set.Retention.Seconds(), set.DeadRetention.Seconds(), set.DiscardRetention.Seconds(), set.BatchSize)
-	if err != nil {
+ ) RETURNING id, status, finished_at
+), kept AS (
+ INSERT INTO %[2]s (id, status, finished_at)
+ SELECT id, status, finished_at FROM removed WHERE status IN ('dead','discarded')
+ ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, finished_at = EXCLUDED.finished_at
+)
+SELECT count(*) FROM removed`, s.table, s.tombstones),
+		set.Retention.Seconds(), set.DeadRetention.Seconds(), set.DiscardRetention.Seconds(), set.BatchSize).
+		Scan(&removed); err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	if _, err := s.exec.Exec(ctx, fmt.Sprintf(`DELETE FROM %[1]s WHERE id IN (
+ SELECT id FROM %[1]s WHERE finished_at < now()-make_interval(secs => $1)
+ ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)`, s.tombstones),
+		set.TombstoneRetention.Seconds(), set.BatchSize); err != nil {
+		return removed, err
+	}
+	return removed, nil
 }
 
 func scanMessages(rows pgx.Rows) ([]message.Message, error) {

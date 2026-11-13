@@ -20,8 +20,8 @@ func TestFS(t *testing.T) {
 
 func TestUp(t *testing.T) {
 	ms := Up()
-	if len(ms) != 3 {
-		t.Fatalf("expected 3 up migrations, got %d", len(ms))
+	if len(ms) != 4 {
+		t.Fatalf("expected 4 up migrations, got %d", len(ms))
 	}
 	if !strings.Contains(ms[0], "CREATE TABLE") || !strings.Contains(ms[0], message.TableName) {
 		t.Fatalf("first migration missing CREATE TABLE %s:\n%s", message.TableName, ms[0])

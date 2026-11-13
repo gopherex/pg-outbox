@@ -108,6 +108,7 @@ var (
 	WithHooks                  = config.WithHooks
 	WithInstrumentation        = config.WithInstrumentation
 	WithErrorRenderer          = config.WithErrorRenderer
+	WithTombstoneRetention     = config.WithTombstoneRetention
 	WithCodec                  = config.WithCodec
 	WithLogger                 = config.WithLogger
 )
@@ -198,6 +199,7 @@ type Outbox struct {
 	relay   *engine.Relay
 	clean   *engine.Cleaner
 	waiters *engine.Waiters
+	gone    engine.GoneRule
 	set     config.Settings
 }
 
@@ -233,19 +235,16 @@ func New(exec Executor, enq Executor, pub Publisher, opts ...Option) (*Outbox, e
 	}
 
 	st := engine.NewStore(exec, enq, listenPool, set.Schema, set.Notify)
-	waiters := engine.NewWaiters(set.Schema, st.DeliveryState, set.WaitRecheck, refusalsCollected(set))
+	gone := engine.NewGoneRule(set)
+	waiters := engine.NewWaiters(set.Schema, st.DeliveryState, set.WaitRecheck, gone)
 	return &Outbox{
 		store:   st,
 		set:     set,
+		gone:    gone,
 		waiters: waiters,
 		relay:   engine.NewRelay(st, pub, set, waiters),
 		clean:   engine.NewCleaner(st, set),
 	}, nil
-}
-
-// refusalsCollected reports whether the cleaner removes dead or discarded rows.
-func refusalsCollected(set config.Settings) bool {
-	return set.DeadRetention > 0 || set.DiscardRetention > 0
 }
 
 // Published reports whether every listed message is delivered. A row still
@@ -256,13 +255,15 @@ func refusalsCollected(set config.Settings) bool {
 // only those rows, by primary key, through the relay executor (never a caller
 // transaction), so other rows and partitions do not affect it.
 //
-// A row that is gone is delivered only while the cleaner removes no refused
-// rows (no WithDeadRetention / WithDiscardRetention): then only a published
-// row can have been removed. With either retention on, a gone row may have
-// been dead or discarded too, and the answer is an error matching
-// ErrOutcomeUnknown (an *UnknownOutcomeError naming the rows). Configure the
-// Outbox that asks with the same retention as the one that cleans. An id
-// never enqueued reads as gone as well.
+// A removed dead or discarded row leaves a tombstone for
+// WithTombstoneRetention, so its refusal is still reported. An id with
+// neither row nor tombstone is delivered when the cleaner removes no refused
+// rows (only a published row can be gone), or when it is a UUIDv7 created
+// within the horizon (shortest refusal retention + tombstone retention − 1h):
+// a refusal that recent would still have its tombstone. Any other such id
+// returns an error matching ErrOutcomeUnknown (an *UnknownOutcomeError
+// naming the rows). Configure the Outbox that asks with the same retentions
+// as the one that cleans. An id never enqueued reads as gone as well.
 func (o *Outbox) Published(ctx context.Context, ids ...string) (bool, error) {
 	canon, err := engine.CanonicalIDs(ids)
 	if err != nil || len(canon) == 0 {
@@ -272,7 +273,7 @@ func (o *Outbox) Published(ctx context.Context, ids ...string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return engine.Verdict(canon, states, refusalsCollected(o.set))
+	return engine.Verdict(canon, states, o.gone)
 }
 
 // WaitPublished blocks until every listed message is delivered (as Published
