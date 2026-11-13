@@ -23,7 +23,7 @@ func TestNewStoreQualifiesTable(t *testing.T) {
 }
 
 // testWaiters is a registry for relays whose tests never wait.
-func testWaiters() *Waiters { return NewWaiters("public", newFake().read, time.Hour) }
+func testWaiters() *Waiters { return NewWaiters("public", newFake().read, time.Hour, false) }
 
 type mutatePublisher struct{}
 

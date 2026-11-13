@@ -110,6 +110,35 @@ func TestPublishedStates(t *testing.T) {
 	}
 }
 
+// While the cleaner also removes refused rows, a gone row's outcome is
+// unknown: Published and WaitPublished say so instead of claiming delivery.
+func TestPublishedWithRefusalsCollected(t *testing.T) {
+	pool := newTestPool(t)
+	ob, err := outbox.New(pool, pool, nil, outbox.WithoutNotify(),
+		outbox.WithDeadRetention(time.Hour), outbox.WithCleanupInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertRow(t, pool, uid(1), outbox.StatusPublished)
+	insertRow(t, pool, uid(2), outbox.StatusDead)
+	ctx := context.Background()
+
+	if done, err := ob.Published(ctx, uid(1)); !done || err != nil {
+		t.Fatalf("present published row: %v, %v", done, err)
+	}
+	var unknown *outbox.UnknownOutcomeError
+	if _, err := ob.Published(ctx, uid(1), uid(3)); !errors.As(err, &unknown) ||
+		!errors.Is(err, outbox.ErrOutcomeUnknown) || !slices.Equal(unknown.IDs, []string{uid(3)}) {
+		t.Fatalf("gone row: %v, want ErrOutcomeUnknown for it", err)
+	}
+	if _, err := ob.Published(ctx, uid(2), uid(3)); !errors.Is(err, outbox.ErrUndelivered) {
+		t.Fatalf("dead + gone: %v, want ErrUndelivered (certain) first", err)
+	}
+	if err := ob.WaitPublished(ctx, uid(3)); !errors.Is(err, outbox.ErrOutcomeUnknown) {
+		t.Fatalf("wait on a gone row: %v, want ErrOutcomeUnknown", err)
+	}
+}
+
 // The wait is settled by the relay's commit notification: the recheck is an
 // hour away, so nothing else could end it. A key stuck behind a failing
 // publish does not hold it.

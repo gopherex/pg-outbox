@@ -335,9 +335,13 @@ done, err := ob.Published(ctx, ids...) // one read: true = all delivered
 err = ob.WaitPublished(ctx, ids...)    // blocks until delivered, undeliverable, or ctx ends
 ```
 
-- **Delivered** means published, or no row at all (the cleaner removed a
-  finished row). An id that was never enqueued, and a dead row removed by
-  `WithDeadRetention`, read as delivered too.
+- **Delivered** means published, or no row at all while the cleaner removes
+  no refused rows (no `WithDeadRetention` / `WithDiscardRetention`): then
+  only a published row can be gone. With either retention on, a gone row may
+  have been dead or discarded too, so it returns an error matching
+  `outbox.ErrOutcomeUnknown` (an `*outbox.UnknownOutcomeError` naming the rows)
+  instead of a false success. Give the `Outbox` that asks the same retention
+  options as the one that cleans. An id never enqueued reads as gone.
 - A row that ended `dead` or `discarded` returns an error matching
   `outbox.ErrUndelivered` (an `*outbox.UndeliveredError` naming the rows): it
   will not be delivered unless requeued. A non-uuid id returns `ErrInvalidID`.

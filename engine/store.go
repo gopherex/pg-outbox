@@ -45,13 +45,13 @@ func NewStore(exec, enq port.Executor, pool *pgxpool.Pool, schema string, notify
 		table: fmt.Sprintf("%q.%s", schema, message.TableName), notifyDone: notifyDone}
 }
 
-// DeliveryState returns the status of every listed row that exists and is not
-// published. ids must be canonical uuids; a row absent from the result is
-// delivered (published, or already removed by the cleaner). It reads through
-// the relay executor, never the caller's transaction, and only by primary key.
+// DeliveryState returns the status of every listed row that exists. ids must
+// be canonical uuids; what an absent row means is Verdict's call. It reads
+// through the relay executor, never the caller's transaction, and only by
+// primary key.
 func (s Store) DeliveryState(ctx context.Context, ids []string) (map[string]message.Status, error) {
 	rows, err := s.exec.Query(ctx, fmt.Sprintf(
-		`SELECT id::text, status FROM %s WHERE id = ANY($1::uuid[]) AND status <> 'published'`, s.table), ids)
+		`SELECT id::text, status FROM %s WHERE id = ANY($1::uuid[])`, s.table), ids)
 	if err != nil {
 		return nil, err
 	}

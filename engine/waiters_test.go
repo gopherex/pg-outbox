@@ -101,7 +101,7 @@ func (f *fakeStates) read(_ context.Context, ids []string) (map[string]message.S
 	}
 	out := map[string]message.Status{}
 	for _, id := range ids {
-		if st, ok := f.states[id]; ok && st != message.StatusPublished {
+		if st, ok := f.states[id]; ok {
 			out[id] = st
 		}
 	}
@@ -168,7 +168,7 @@ func TestWaitersOutcomes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newFake(tc.pending...)
-			w := NewWaiters("public", f.read, time.Hour)
+			w := NewWaiters("public", f.read, time.Hour, false)
 			res := waitAsync(t, w, f, t.Context(), idA, idB)
 			for _, p := range tc.notify {
 				w.Notify(p)
@@ -192,7 +192,7 @@ func TestWaitersOutcomes(t *testing.T) {
 func TestWaitersIgnoreForeignNotifications(t *testing.T) {
 	t.Parallel()
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, time.Hour)
+	w := NewWaiters("public", f.read, time.Hour, false)
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	res := waitAsync(t, w, f, ctx, idA)
@@ -216,7 +216,7 @@ func TestWaitersRecheckIsShared(t *testing.T) {
 	const waiters = 50
 	interval := 20 * time.Millisecond
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, interval)
+	w := NewWaiters("public", f.read, interval, false)
 	results := make([]<-chan error, waiters)
 	for i := range results {
 		results[i] = waitAsync(t, w, f, t.Context(), idA)
@@ -239,7 +239,7 @@ func TestWaitersTimeoutReportsReadFailure(t *testing.T) {
 	t.Parallel()
 	errDB := errors.New("db down")
 	f := newFake(idA)
-	w := NewWaiters("public", f.read, 10*time.Millisecond)
+	w := NewWaiters("public", f.read, 10*time.Millisecond, false)
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	res := waitAsync(t, w, f, ctx, idA)
@@ -256,7 +256,7 @@ func TestWaitersFirstReadFailure(t *testing.T) {
 	errDB := errors.New("db down")
 	f := newFake()
 	f.fail(errDB)
-	w := NewWaiters("public", f.read, time.Hour)
+	w := NewWaiters("public", f.read, time.Hour, false)
 	if err := w.Wait(t.Context(), []string{idA}); !errors.Is(err, errDB) {
 		t.Fatalf("outcome = %v, want %v", err, errDB)
 	}
@@ -265,12 +265,61 @@ func TestWaitersFirstReadFailure(t *testing.T) {
 	}
 }
 
+func TestVerdict(t *testing.T) {
+	t.Parallel()
+	pub, pend, dead := message.StatusPublished, message.StatusPending, message.StatusDead
+	for _, tc := range []struct {
+		name      string
+		states    map[string]message.Status
+		collected bool
+		done      bool
+		err       error
+		ids       []string
+	}{
+		{name: "published", states: map[string]message.Status{idA: pub, idB: pub}, done: true},
+		{name: "gone is delivered while refusals are kept", states: map[string]message.Status{idA: pub}, done: true},
+		{name: "gone is unknown while refusals are collected", states: map[string]message.Status{idA: pub},
+			collected: true, err: ErrOutcomeUnknown, ids: []string{idB}},
+		{name: "in flight", states: map[string]message.Status{idA: pub, idB: pend}},
+		{name: "refusal wins over unknown", states: map[string]message.Status{idA: dead}, collected: true,
+			err: ErrUndelivered, ids: []string{idA}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			done, err := Verdict([]string{idA, idB}, tc.states, tc.collected)
+			if done != tc.done || !errors.Is(err, tc.err) || (tc.err == nil) != (err == nil) {
+				t.Fatalf("Verdict = %v, %v; want %v, %v", done, err, tc.done, tc.err)
+			}
+			var u *UndeliveredError
+			var k *UnknownOutcomeError
+			switch {
+			case errors.As(err, &u) && !slices.Equal(u.IDs, tc.ids):
+				t.Fatalf("undelivered %v, want %v", u.IDs, tc.ids)
+			case errors.As(err, &k) && !slices.Equal(k.IDs, tc.ids):
+				t.Fatalf("unknown %v, want %v", k.IDs, tc.ids)
+			}
+		})
+	}
+}
+
+// With refused rows collected, a wait on a gone row ends with the unknown
+// outcome instead of a false success.
+func TestWaitersGoneRowOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	w := NewWaiters("public", newFake().read, time.Hour, true)
+	err := w.Wait(t.Context(), []string{idA})
+	var k *UnknownOutcomeError
+	if !errors.As(err, &k) || !slices.Equal(k.IDs, []string{idA}) {
+		t.Fatalf("outcome = %v, want unknown for %s", err, idA)
+	}
+}
+
 func BenchmarkWaitersNotify(b *testing.B) {
 	ids := make([]string, doneChunk)
 	for i := range ids {
 		ids[i] = fmt.Sprintf("0190a5f0-0000-7000-8000-%012d", i)
 	}
-	w := NewWaiters("public", newFake().read, time.Hour)
+	w := NewWaiters("public", newFake().read, time.Hour, false)
 	for _, id := range ids[:10] {
 		w.register([]string{id})
 	}

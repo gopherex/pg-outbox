@@ -46,6 +46,75 @@ func (e *UndeliveredError) Error() string {
 // Is makes errors.Is(err, ErrUndelivered) true.
 func (e *UndeliveredError) Is(target error) bool { return target == ErrUndelivered }
 
+// ErrOutcomeUnknown matches an UnknownOutcomeError through errors.Is.
+var ErrOutcomeUnknown = errors.New("outbox: delivery outcome unknown")
+
+// UnknownOutcomeError names rows that are gone while the cleaner also removes
+// dead or discarded rows: a missing row may have been published or refused,
+// and nothing left tells which.
+type UnknownOutcomeError struct {
+	IDs []string // sorted, canonical
+}
+
+func (e *UnknownOutcomeError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrOutcomeUnknown, strings.Join(e.IDs, ", "))
+}
+
+// Is makes errors.Is(err, ErrOutcomeUnknown) true.
+func (e *UnknownOutcomeError) Is(target error) bool { return target == ErrOutcomeUnknown }
+
+// statusGone marks a row the read did not find.
+const statusGone message.Status = "gone"
+
+// settled reads one row's state: delivered, failed (dead/discarded), unknown
+// (gone while refused rows are collected too), or still in flight (none).
+// A gone row is delivered only when the cleaner never removes refused rows:
+// then only a published row can have been removed.
+func settled(st message.Status, refusalsCollected bool) (delivered, failed, unknown bool) {
+	switch st {
+	case message.StatusPublished:
+		return true, false, false
+	case message.StatusDead, message.StatusDiscarded:
+		return false, true, false
+	case statusGone:
+		return !refusalsCollected, false, refusalsCollected
+	}
+	return false, false, false
+}
+
+// Verdict decides a delivery query over ids from a state read: done when every
+// row is delivered; an UndeliveredError when any ended dead or discarded
+// (first, it is certain); an UnknownOutcomeError when any is gone and its
+// outcome cannot be known; otherwise not done yet.
+func Verdict(ids []string, states map[string]message.Status, refusalsCollected bool) (bool, error) {
+	var failed, unknown []string
+	pending := false
+	for _, id := range ids {
+		st, found := states[id]
+		if !found {
+			st = statusGone
+		}
+		d, f, u := settled(st, refusalsCollected)
+		switch {
+		case f:
+			failed = append(failed, id)
+		case u:
+			unknown = append(unknown, id)
+		case !d:
+			pending = true
+		}
+	}
+	switch {
+	case len(failed) > 0:
+		slices.Sort(failed)
+		return false, &UndeliveredError{IDs: failed}
+	case len(unknown) > 0:
+		slices.Sort(unknown)
+		return false, &UnknownOutcomeError{IDs: unknown}
+	}
+	return !pending, nil
+}
+
 // CanonicalIDs validates ids as uuids and returns them deduplicated in the
 // canonical lowercase hyphenated form PostgreSQL prints, so they compare equal
 // to ids read back from the table or a notification.
@@ -85,8 +154,8 @@ func parseDone(payload string) (schema string, status message.Status, ids []stri
 	return schema, message.Status(st), strings.Split(list, ","), true
 }
 
-// stateReader returns the status of every listed row that exists and is not
-// published; a row absent from the result is delivered.
+// stateReader returns the status of every listed row that exists; a row
+// absent from the result is gone (see settled).
 type stateReader func(ctx context.Context, ids []string) (map[string]message.Status, error)
 
 // Waiters resolves WaitPublished calls. A call registers its ids, then learns
@@ -98,6 +167,9 @@ type Waiters struct {
 	schema   string
 	read     stateReader
 	interval time.Duration
+	// refusalsCollected: the cleaner removes dead/discarded rows, so a gone
+	// row's outcome is unknown (see settled).
+	refusalsCollected bool
 
 	mu        sync.Mutex
 	byID      map[string][]*waiter
@@ -110,13 +182,16 @@ type Waiters struct {
 type waiter struct {
 	pending     map[string]struct{}
 	undelivered []string
+	unknown     []string
 	done        chan struct{} // closed once the outcome is known
 }
 
 // NewWaiters builds the waiter registry for one schema. interval paces the
-// shared recheck.
-func NewWaiters(schema string, read stateReader, interval time.Duration) *Waiters {
-	return &Waiters{schema: schema, read: read, interval: interval, byID: map[string][]*waiter{}}
+// shared recheck; refusalsCollected tells whether the cleaner removes dead or
+// discarded rows (see settled).
+func NewWaiters(schema string, read stateReader, interval time.Duration, refusalsCollected bool) *Waiters {
+	return &Waiters{schema: schema, read: read, interval: interval, refusalsCollected: refusalsCollected,
+		byID: map[string][]*waiter{}}
 }
 
 // Wait blocks until every id is delivered, one ends undelivered, or ctx ends.
@@ -194,34 +269,39 @@ func (w *Waiters) unregister(wt *waiter, ids []string) {
 func (w *Waiters) outcome(wt *waiter) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(wt.undelivered) == 0 {
-		return nil
+	switch {
+	case len(wt.undelivered) > 0:
+		ids := slices.Clone(wt.undelivered)
+		slices.Sort(ids)
+		return &UndeliveredError{IDs: ids}
+	case len(wt.unknown) > 0:
+		ids := slices.Clone(wt.unknown)
+		slices.Sort(ids)
+		return &UnknownOutcomeError{IDs: ids}
 	}
-	ids := slices.Clone(wt.undelivered)
-	slices.Sort(ids)
-	return &UndeliveredError{IDs: ids}
+	return nil
 }
 
-// apply records a state read: a checked id absent from states is delivered.
-// A read only ever settles waiters, so a stale one cannot undo a notification.
+// apply records a state read; a checked id absent from states is gone (see
+// settled). A read only ever settles waiters, so a stale one cannot undo a
+// notification.
 func (w *Waiters) apply(checked []string, states map[string]message.Status) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, id := range checked {
 		st, found := states[id]
 		if !found {
-			st = message.StatusPublished
+			st = statusGone
 		}
 		w.settleLocked(id, st)
 	}
 }
 
-// settleLocked moves every waiter of id forward by status. Non-terminal
-// statuses change nothing.
+// settleLocked moves every waiter of id forward by status. Statuses still in
+// flight change nothing.
 func (w *Waiters) settleLocked(id string, status message.Status) {
-	switch status {
-	case message.StatusPublished, message.StatusDead, message.StatusDiscarded:
-	default:
+	delivered, failed, unknown := settled(status, w.refusalsCollected)
+	if !delivered && !failed && !unknown {
 		return
 	}
 	for _, wt := range w.byID[id] {
@@ -229,8 +309,11 @@ func (w *Waiters) settleLocked(id string, status message.Status) {
 			continue
 		}
 		delete(wt.pending, id)
-		if status != message.StatusPublished {
+		switch {
+		case failed:
 			wt.undelivered = append(wt.undelivered, id)
+		case unknown:
+			wt.unknown = append(wt.unknown, id)
 		}
 		if len(wt.pending) == 0 {
 			close(wt.done)

@@ -18,7 +18,6 @@ import (
 	"embed"
 	"errors"
 	"maps"
-	"slices"
 
 	"github.com/gopherex/pg-outbox/backoff"
 	"github.com/gopherex/pg-outbox/config"
@@ -177,11 +176,17 @@ var (
 	ErrInvalidID = engine.ErrInvalidID
 	// ErrUndelivered matches an *UndeliveredError through errors.Is.
 	ErrUndelivered = engine.ErrUndelivered
+	// ErrOutcomeUnknown matches an *UnknownOutcomeError through errors.Is.
+	ErrOutcomeUnknown = engine.ErrOutcomeUnknown
 )
 
 // UndeliveredError names the rows Published / WaitPublished found dead or
 // discarded; they will not be delivered unless requeued.
 type UndeliveredError = engine.UndeliveredError
+
+// UnknownOutcomeError names the rows Published / WaitPublished found gone
+// while dead or discarded rows are collected too, so their outcome is unknown.
+type UnknownOutcomeError = engine.UnknownOutcomeError
 
 // ---- Facade -----------------------------------------------------------
 
@@ -227,7 +232,7 @@ func New(exec Executor, enq Executor, pub Publisher, opts ...Option) (*Outbox, e
 	}
 
 	st := engine.NewStore(exec, enq, listenPool, set.Schema, set.Notify)
-	waiters := engine.NewWaiters(set.Schema, st.DeliveryState, set.WaitRecheck)
+	waiters := engine.NewWaiters(set.Schema, st.DeliveryState, set.WaitRecheck, refusalsCollected(set))
 	return &Outbox{
 		store:   st,
 		set:     set,
@@ -237,17 +242,26 @@ func New(exec Executor, enq Executor, pub Publisher, opts ...Option) (*Outbox, e
 	}, nil
 }
 
-// Published reports whether every listed message is delivered: published, or
-// already removed by the cleaner. A row still pending or being published
-// makes it false. A row that ended dead or discarded returns an error matching
-// ErrUndelivered (an *UndeliveredError naming the rows): it will not be
-// delivered unless requeued. ids are the Message.IDs given to Enqueue; a
-// non-uuid id returns ErrInvalidID. It reads only those rows, by primary key,
-// through the relay executor (never a caller transaction), so other rows and
-// partitions do not affect it.
+// refusalsCollected reports whether the cleaner removes dead or discarded rows.
+func refusalsCollected(set config.Settings) bool {
+	return set.DeadRetention > 0 || set.DiscardRetention > 0
+}
+
+// Published reports whether every listed message is delivered. A row still
+// pending or being published makes it false. A row that ended dead or
+// discarded returns an error matching ErrUndelivered (an *UndeliveredError
+// naming the rows): it will not be delivered unless requeued. ids are the
+// Message.IDs given to Enqueue; a non-uuid id returns ErrInvalidID. It reads
+// only those rows, by primary key, through the relay executor (never a caller
+// transaction), so other rows and partitions do not affect it.
 //
-// An id with no row reads as delivered: that covers rows the cleaner removed,
-// but also an id never enqueued and a dead row removed by WithDeadRetention.
+// A row that is gone is delivered only while the cleaner removes no refused
+// rows (no WithDeadRetention / WithDiscardRetention): then only a published
+// row can have been removed. With either retention on, a gone row may have
+// been dead or discarded too, and the answer is an error matching
+// ErrOutcomeUnknown (an *UnknownOutcomeError naming the rows). Configure the
+// Outbox that asks with the same retention as the one that cleans. An id
+// never enqueued reads as gone as well.
 func (o *Outbox) Published(ctx context.Context, ids ...string) (bool, error) {
 	canon, err := engine.CanonicalIDs(ids)
 	if err != nil || len(canon) == 0 {
@@ -257,17 +271,7 @@ func (o *Outbox) Published(ctx context.Context, ids ...string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	var undelivered []string
-	for id, st := range states {
-		if st == StatusDead || st == StatusDiscarded {
-			undelivered = append(undelivered, id)
-		}
-	}
-	if len(undelivered) > 0 {
-		slices.Sort(undelivered)
-		return false, &UndeliveredError{IDs: undelivered}
-	}
-	return len(states) == 0, nil
+	return engine.Verdict(canon, states, refusalsCollected(o.set))
 }
 
 // WaitPublished blocks until every listed message is delivered (as Published
