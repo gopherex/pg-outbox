@@ -3,7 +3,7 @@ module github.com/gopherex/pg-outbox/contrib/publishers/nats
 go 1.25.0
 
 require (
-	github.com/gopherex/pg-outbox v1.3.0
+	github.com/gopherex/pg-outbox v1.4.0
 	github.com/nats-io/nats.go v1.47.0
 )
 
