@@ -6,8 +6,8 @@ module github.com/gopherex/pg-outbox/test/integration
 go 1.25.0
 
 require (
-	github.com/gopherex/pg-outbox v1.5.1
-	github.com/gopherex/xtrace v1.1.6
+	github.com/gopherex/pg-outbox v1.5.2
+	github.com/gopherex/xtrace v1.3.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0

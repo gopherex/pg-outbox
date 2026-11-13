@@ -10,6 +10,7 @@ package outboxtrace
 
 import (
 	"context"
+	"fmt"
 
 	outbox "github.com/gopherex/pg-outbox"
 	"github.com/gopherex/xtrace"
@@ -30,8 +31,11 @@ const SpanName = "outbox deliver"
 type Option func(*Instrumentation)
 
 // WithScope sets the scope whose tracer starts delivery spans (default
-// xtrace.New(ScopeName) on the global tracer provider).
-func WithScope(s *xtrace.Scope) Option { return func(i *Instrumentation) { i.tracer = s.Tracer() } }
+// xtrace.New(ScopeName) on the global tracer provider). The scope's error
+// renderer (xtrace.WithErrorRenderer) renders a failed delivery's cause.
+func WithScope(s *xtrace.Scope) Option {
+	return func(i *Instrumentation) { i.tracer, i.render = s.Tracer(), s.ErrorRenderer() }
+}
 
 // WithPropagator sets the propagator that writes and reads the headers
 // (default otel.GetTextMapPropagator()).
@@ -43,6 +47,7 @@ func WithPropagator(p propagation.TextMapPropagator) Option {
 type Instrumentation struct {
 	tracer     trace.Tracer
 	propagator propagation.TextMapPropagator
+	render     func(error) string // nil: the cause is recorded as is
 }
 
 var _ outbox.Instrumentation = (*Instrumentation)(nil)
@@ -71,6 +76,21 @@ func (i *Instrumentation) Capture(ctx context.Context, headers map[string]string
 	i.propagator.Inject(ctx, propagation.MapCarrier(headers))
 }
 
+// recordError writes the exception event, with the cause rendered when the
+// scope has a renderer (RecordError would write err.Error()).
+func (i *Instrumentation) recordError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	if i.render == nil {
+		span.RecordError(err)
+		return
+	}
+	span.AddEvent("exception", trace.WithAttributes(
+		attribute.String("exception.type", fmt.Sprintf("%T", err)),
+		attribute.String("exception.message", i.render(err))))
+}
+
 // Deliver starts the delivery span of m: a new root, of kind producer, linked
 // to the origin captured in m's headers when there is one. Attributes are
 // bounded: the topic, the attempt number and, at the end, the outcome.
@@ -92,7 +112,7 @@ func (i *Instrumentation) Deliver(ctx context.Context, m outbox.Message) (contex
 		span.SetAttributes(attribute.String("outbox.outcome", string(o.Status)))
 		// A scheduled retry and a discard are expected refusals, not failures.
 		if o.Status == outbox.StatusDead || o.Status == outbox.StatusProcessing {
-			span.RecordError(o.Err)
+			i.recordError(span, o.Err)
 			span.SetStatus(codes.Error, string(o.Status))
 		}
 		span.End()

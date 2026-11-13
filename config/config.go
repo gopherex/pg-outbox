@@ -45,6 +45,7 @@ type Settings struct {
 	Fatal                  func(error) bool
 	Hooks                  port.Hooks
 	Instrumentation        port.Instrumentation
+	ErrorRenderer          func(error) string
 	Codec                  port.Codec
 	Logger                 *slog.Logger
 }
@@ -284,6 +285,14 @@ func WithInstrumentation(i port.Instrumentation) Option {
 			s.Instrumentation = i
 		}
 	}
+}
+
+// WithErrorRenderer renders a failed publish's error before it is stored as
+// the row's last_error (default err.Error()). Pass the renderer the service's
+// logger and tracer use (xlog.NewErrorRenderer), so signed URLs or database
+// values never land in the table.
+func WithErrorRenderer(render func(error) string) Option {
+	return func(s *Settings) { s.ErrorRenderer = render }
 }
 
 // WithCodec sets the codec used by EnqueueValue.

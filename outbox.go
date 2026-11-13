@@ -107,6 +107,7 @@ var (
 	WithFatal                  = config.WithFatal
 	WithHooks                  = config.WithHooks
 	WithInstrumentation        = config.WithInstrumentation
+	WithErrorRenderer          = config.WithErrorRenderer
 	WithCodec                  = config.WithCodec
 	WithLogger                 = config.WithLogger
 )

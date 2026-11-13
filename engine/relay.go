@@ -69,7 +69,9 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 	}
 
 	rec := outcomes{}
-	var ends map[string]func(port.Outcome)
+	// Open deliveries; the settler ends early-committed ones, the rest end
+	// here with the batch.
+	ends := make(map[string]func(port.Outcome), len(msgs))
 	defer func() { endDeliveries(msgs, ends, rec, err) }()
 
 	pubCtx, cancel := context.WithCancel(ctx)
@@ -82,13 +84,12 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 	// Early outcomes (port.Settle) commit while the batch is still publishing.
 	// Closed before the deliveries end (defers run in reverse), since those
 	// read what it recorded.
-	st := newSettler(r, ctx, msgs, rec)
+	st := newSettler(r, ctx, msgs, rec, ends)
 	go st.run()
 	defer st.close()
 	pubCtx = port.WithSettler(pubCtx, st)
 
 	byID := make(map[string]context.Context, len(msgs))
-	ends = make(map[string]func(port.Outcome), len(msgs))
 	// Publishers get copies: adapters may modify what they receive, while the
 	// heartbeat and completion must keep the original claim tokens.
 	out := make([]message.Message, len(msgs))
@@ -233,7 +234,11 @@ func (r *Relay) settle(ctx context.Context, msgs []message.Message, perr error, 
 // actually changed (a row whose lease was lost is not recorded).
 func (r *Relay) complete(ctx context.Context, msgs []message.Message, status message.Status, cause error, delay time.Duration, rec outcomes) error {
 	reason := ""
-	if cause != nil {
+	switch {
+	case cause == nil:
+	case r.set.ErrorRenderer != nil:
+		reason = r.set.ErrorRenderer(cause) // stored: never the raw text
+	default:
 		reason = cause.Error()
 	}
 	completed, err := r.store.finish(ctx, msgs, status, reason, delay, r.set.ClearPayloadOnComplete)

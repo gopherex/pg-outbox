@@ -239,8 +239,11 @@ outbox.WithFatal(func(err error) bool { return errors.Is(err, errBrokerGone) })
 
 The library treats payloads as opaque bytes. Application policy, deadlines,
 provider error classification, recipient preferences, and authorization belong
-in the caller/publisher. Store only sanitized errors: error text is persisted
-in `last_error` and passed to observability hooks.
+in the caller/publisher. Error text is persisted in `last_error`; set
+`outbox.WithErrorRenderer(render)` with the service's renderer
+(`xlog.NewErrorRenderer(xlog.RedactURL, xlogpgx.RedactPgError)`) so signed
+URLs and database values are stored redacted. Hooks and instrumentation get
+the original error.
 
 ### Claims, cancellation, and completion
 
@@ -325,7 +328,9 @@ type Instrumentation interface {
   `Outcome`: the committed status (`published`, `pending` for a scheduled
   retry, `dead`, `discarded`, per message under `PerMessage`), or
   `processing` with the cause when the attempt left the row claimed (abort,
-  panic, lost lease, failed completion).
+  panic, lost lease, failed completion). It runs at that message's own
+  commit: a message reported early with `Settle` ends when its outcome
+  commits, not when the batch's slowest message does.
 
 ### Waiting for delivery
 

@@ -33,6 +33,10 @@ ob, err := outbox.New(pool, enq, pub,
   refusals and leave the span unmarked; a dead row or an attempt left claimed
   records the error and sets the span status to Error.
 
+A failed delivery's cause is recorded through the scope's error renderer when
+it has one (`xtrace.New(name, xtrace.WithErrorRenderer(render))`), so the span
+never carries a raw signed URL or database value.
+
 Options: `WithScope(xtrace.New(...))` for the tracer (default scope
 `github.com/gopherex/pg-outbox` on the global provider),
 `WithPropagator(p)` (default `otel.GetTextMapPropagator()`).

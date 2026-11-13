@@ -3,6 +3,7 @@ package outboxtrace
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	outbox "github.com/gopherex/pg-outbox"
@@ -120,6 +121,32 @@ func TestDeliveryOutcomeStatus(t *testing.T) {
 				t.Fatalf("outcome %q, want %q", got, tc.status)
 			}
 		})
+	}
+}
+
+// A scope's error renderer keeps the raw cause out of the delivery span.
+func TestDeliveryRendersErrors(t *testing.T) {
+	t.Parallel()
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+	inst := New(WithScope(xtrace.New("test", xtrace.WithTracerProvider(tp),
+		xtrace.WithErrorRenderer(func(error) string { return "rendered" }))))
+
+	_, end := inst.Deliver(context.Background(), outbox.Message{ID: "a", Topic: "t"})
+	end(outbox.Outcome{Status: outbox.StatusDead, Err: errors.New("GET https://h/p?token=secret")})
+
+	d := exp.GetSpans()[0]
+	if len(d.Events) != 1 || d.Status.Code != codes.Error {
+		t.Fatalf("events %v status %v", d.Events, d.Status)
+	}
+	for _, a := range d.Events[0].Attributes {
+		if strings.Contains(a.Value.Emit(), "secret") {
+			t.Fatalf("raw cause leaked: %v", d.Events[0].Attributes)
+		}
+		if a.Key == "exception.message" && a.Value.AsString() != "rendered" {
+			t.Fatalf("exception.message = %q", a.Value.AsString())
+		}
 	}
 }
 

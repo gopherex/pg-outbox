@@ -25,6 +25,10 @@ type settler struct {
 	ctx    context.Context // relay context for the commits
 	rec    outcomes
 	claims map[string]message.Message // the batch, by id; immutable
+	// ends are the open Instrumentation deliveries, shared with processBatch:
+	// a commit ends its rows' deliveries and removes them, so each ends once
+	// and at its own commit. processBatch reads it only after close.
+	ends map[string]func(port.Outcome)
 
 	io sync.Mutex // serializes renew and commit (database I/O, never taken by Settle)
 	// inFlight are claims not yet committed (guarded by io): renewed by the
@@ -50,14 +54,14 @@ type early struct {
 
 var _ port.Settler = (*settler)(nil)
 
-func newSettler(r *Relay, ctx context.Context, msgs []message.Message, rec outcomes) *settler {
+func newSettler(r *Relay, ctx context.Context, msgs []message.Message, rec outcomes, ends map[string]func(port.Outcome)) *settler {
 	claims := make(map[string]message.Message, len(msgs))
 	inFlight := make(map[string]message.Message, len(msgs))
 	for _, m := range msgs {
 		claims[m.ID], inFlight[m.ID] = m, m
 	}
 	return &settler{
-		relay: r, ctx: ctx, rec: rec, claims: claims, inFlight: inFlight,
+		relay: r, ctx: ctx, rec: rec, claims: claims, inFlight: inFlight, ends: ends,
 		reported: map[string]bool{}, wake: make(chan struct{}, 1), closing: make(chan struct{}), done: make(chan struct{}),
 	}
 }
@@ -138,13 +142,25 @@ func (s *settler) commit(batch []early) {
 	s.io.Lock()
 	err := s.relay.settleEach(s.ctx, msgs, &port.BatchError{Outcomes: outcomes}, s.rec)
 	released := false
+	var ended []func()
 	for _, m := range msgs {
 		delete(s.inFlight, m.ID) // committed, or no longer ours (lease lost)
-		if o, ok := s.rec[m.ID]; ok && s.relay.releasesPartition(o.Status) {
+		o, ok := s.rec[m.ID]
+		if !ok {
+			continue // lease lost: ended with the batch's error at its end
+		}
+		if s.relay.releasesPartition(o.Status) {
 			released = true
+		}
+		if end := s.ends[m.ID]; end != nil {
+			delete(s.ends, m.ID)
+			ended = append(ended, func() { end(o) })
 		}
 	}
 	s.io.Unlock()
+	for _, end := range ended {
+		end()
+	}
 	// The partitions these rows held are free: let an idle worker claim their
 	// next rows now rather than at the next poll. (Other instances learn it
 	// from the commit's done notification.)

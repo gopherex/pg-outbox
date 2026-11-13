@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -68,7 +69,9 @@ func TestSettleReleasesOtherPartitions(t *testing.T) {
 	})
 	ob, err := outbox.New(pool, pool, pub, outbox.WithOrdered(true), outbox.WithConcurrency(4),
 		outbox.WithBatchSize(100), outbox.WithLeaseDuration(600*time.Millisecond),
-		outbox.WithPollInterval(10*time.Millisecond), outbox.WithWaitRecheck(time.Hour))
+		// Rows are queued before Run, so the first done notifications can
+		// precede the LISTEN connection; the recheck covers those.
+		outbox.WithPollInterval(10*time.Millisecond), outbox.WithWaitRecheck(50*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +166,75 @@ func TestSettleWakesIdleWorkers(t *testing.T) {
 			}
 			t.Logf("partition B delivered in %s", time.Since(start))
 		})
+	}
+}
+
+// An early-settled message's delivery ends at its own commit, while the slow
+// sibling of its batch is still publishing; each ends exactly once.
+func TestSettleEndsDeliveryAtCommit(t *testing.T) {
+	pool := newTestPool(t)
+	a1, b1 := uid(1), uid(2)
+	seedKeyed(t, pool, [2]string{a1, "A"}, [2]string{b1, "B"})
+	gate := make(chan struct{})
+	rec := &recorder{ends: map[string][]outbox.Outcome{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ob, err := outbox.New(pool, pool, gatedPublisher(gate), outbox.WithInstrumentation(rec),
+		outbox.WithBatchSize(10), outbox.WithPollInterval(10*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = ob.Run(ctx) }()
+
+	waitFor(t, 5*time.Second, func() bool { return len(rec.outcomes()[b1]) == 1 })
+	if got := rec.outcomes()[a1]; len(got) != 0 {
+		t.Fatalf("A1 ended %v while still publishing", got)
+	}
+	close(gate)
+	waitFor(t, 5*time.Second, func() bool { return len(rec.outcomes()[a1]) == 1 })
+	time.Sleep(100 * time.Millisecond) // a second end would show up here
+	for id, want := range map[string]outbox.Status{a1: outbox.StatusPublished, b1: outbox.StatusPublished} {
+		if got := rec.outcomes()[id]; len(got) != 1 || got[0].Status != want {
+			t.Fatalf("%s ended %v, want once %s", id, got, want)
+		}
+	}
+}
+
+// last_error is stored through the error renderer, on every path that records
+// a failure: a retry and a dead row from Publish's return, and an early Settle.
+func TestLastErrorRendered(t *testing.T) {
+	pool := newTestPool(t)
+	seedKeyed(t, pool, [2]string{uid(1), ""}, [2]string{uid(2), ""}, [2]string{uid(3), ""})
+	leak := errors.New("GET https://h/p?token=secret")
+	pub := publisherFunc(func(ctx context.Context, ms []outbox.Message) error {
+		outcomes := map[string]error{}
+		for _, m := range ms {
+			switch m.ID {
+			case uid(1):
+				outcomes[m.ID] = outbox.RetryAfter(leak, time.Hour)
+			case uid(2):
+				outcomes[m.ID] = outbox.Permanent(leak)
+			case uid(3):
+				if err := outbox.Settle(ctx, m, outbox.Permanent(leak)); err != nil {
+					return err
+				}
+			}
+		}
+		return outbox.PerMessage(outcomes, nil)
+	})
+	relay(t, pool, pub, outbox.WithBatchSize(10),
+		outbox.WithErrorRenderer(func(err error) string { return "redacted " + fmt.Sprintf("%T", err) }))
+	for id, want := range map[string]string{uid(1): "pending", uid(2): "dead", uid(3): "dead"} {
+		// A new row is pending too: wait for its first attempt to be recorded.
+		waitFor(t, 5*time.Second, func() bool { st, n := rowState(t, pool, id); return st == want && n == 1 })
+		var lastErr string
+		if err := pool.QueryRow(context.Background(), `SELECT last_error FROM outbox_messages WHERE id = $1`, id).
+			Scan(&lastErr); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(lastErr, "redacted ") || strings.Contains(lastErr, "secret") {
+			t.Fatalf("%s last_error = %q", id, lastErr)
+		}
 	}
 }
 

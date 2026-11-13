@@ -39,7 +39,7 @@ func TestPublisherCannotChangeClaimIdentity(t *testing.T) {
 	msgs := []message.Message{{ID: "claim-id", LeaseToken: "claim-token", Attempts: 1}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	st := newSettler(r, ctx, msgs, outcomes{})
+	st := newSettler(r, ctx, msgs, outcomes{}, map[string]func(port.Outcome){})
 	go st.run()
 	defer st.close()
 	if err, leaseErr := r.publish(ctx, cancel, st, append([]message.Message(nil), msgs...)); err != nil || leaseErr != nil {
