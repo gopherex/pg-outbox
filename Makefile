@@ -133,6 +133,17 @@ release:
 	  for t in "$${TAGS[@]}"; do git tag -a "$$t" -m "$$t"; done
 	  git push origin HEAD
 	  for t in "$${TAGS[@]}"; do git push origin "$$t"; done
+	  # go.sum can only hold the new root version once its tag is public;
+	  # test/integration is not released but requires the released modules.
+	  for d in $(MODDIRS); do
+	    [ "$$d" = "." ] && continue
+	    ( cd "$$d" && GOWORK=off go mod tidy )
+	  done
+	  git add -A
+	  if ! git diff --cached --quiet; then
+	    git commit -m "chore(release): sync go.sum with v$$new"
+	    git push origin HEAD
+	  fi
 	  echo "✓ Released v$$new ($${#TAGS[@]} modules)."
 	  ;;
 	*)
