@@ -20,7 +20,10 @@ import (
 // RetryAfter, Discard and Abort control the outcome of the entire batch;
 // PerMessage gives each message its own outcome. A panic is recovered and stops
 // the relay like Abort. Publish must
-// honor context cancellation; claims are renewed while it runs.
+// honor context cancellation; claims are renewed while it runs. The Publish
+// context has no deadline (it ends on cancellation only): a message's publish
+// budget is on MessageContext(ctx, m), which a publisher waits on to bound
+// one message.
 type Publisher interface {
 	Publish(ctx context.Context, msgs []message.Message) error
 }

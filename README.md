@@ -266,8 +266,11 @@ expiry. Publishers must honor cancellation and configure transport timeouts.
 ends that long after the publisher first asks for it, so a publisher sending
 rows one by one or through a bounded pool never fails a row on the time a
 slow neighbour took, and a row that times out is retried on its own attempt.
-The Publish call itself has no deadline; a publisher sending the whole batch
-in one transport call bounds it with its transport timeout. Cancellation cannot undo an external side effect, and
+The Publish call itself has no deadline: its context ends only on
+cancellation (shutdown, lost lease), so a publisher that bounds a hung row by
+waiting on it waits forever; it waits on `outbox.MessageContext(ctx, m)`
+instead. A publisher sending the whole batch in one transport call bounds it
+with its transport timeout. Cancellation cannot undo an external side effect, and
 an adapter that ignores context cannot be forcibly stopped. Delivery remains
 at-least-once, including when publication succeeds but recording it fails.
 
