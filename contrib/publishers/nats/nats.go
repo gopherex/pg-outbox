@@ -3,6 +3,7 @@ package nats
 
 import (
 	"context"
+	"time"
 
 	outbox "github.com/gopherex/pg-outbox"
 	natsgo "github.com/nats-io/nats.go"
@@ -45,20 +46,37 @@ func WithoutFlush() Option {
 	return func(p *Publisher) { p.flush = false }
 }
 
+// defaultFlushTimeout is the bound nats.go's own Conn.Flush uses.
+const defaultFlushTimeout = 10 * time.Second
+
+// WithFlushTimeout bounds the flush after each batch (default 10s, as
+// nats.go's Conn.Flush). NATS refuses a flush without a deadline, and the
+// relay's Publish context has none of its own; a non-positive d keeps the
+// default.
+func WithFlushTimeout(d time.Duration) Option {
+	return func(p *Publisher) {
+		if d > 0 {
+			p.flushTimeout = d
+		}
+	}
+}
+
 // Publisher delivers outbox batches to NATS.
 type Publisher struct {
-	client Client
-	mapper Mapper
-	flush  bool
+	client       Client
+	mapper       Mapper
+	flush        bool
+	flushTimeout time.Duration
 }
 
 // New builds a NATS publisher. A nil client will panic when Publish is called,
 // matching the behavior of using a nil transport dependency directly.
 func New(client Client, opts ...Option) *Publisher {
 	p := &Publisher{
-		client: client,
-		mapper: DefaultMapper,
-		flush:  true,
+		client:       client,
+		mapper:       DefaultMapper,
+		flush:        true,
+		flushTimeout: defaultFlushTimeout,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -78,7 +96,9 @@ func (p *Publisher) Publish(ctx context.Context, msgs []outbox.Message) error {
 		}
 	}
 	if p.flush {
-		return p.client.FlushWithContext(ctx)
+		flushCtx, cancel := context.WithTimeout(ctx, p.flushTimeout)
+		defer cancel()
+		return p.client.FlushWithContext(flushCtx)
 	}
 	return nil
 }

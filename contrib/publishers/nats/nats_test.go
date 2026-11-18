@@ -4,15 +4,17 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	outbox "github.com/gopherex/pg-outbox"
 	natsgo "github.com/nats-io/nats.go"
 )
 
 type fakeClient struct {
-	msgs    []*natsgo.Msg
-	pubErr  error
-	flushes int
+	msgs     []*natsgo.Msg
+	pubErr   error
+	flushes  int
+	deadline time.Time
 }
 
 func (f *fakeClient) PublishMsg(msg *natsgo.Msg) error {
@@ -23,8 +25,14 @@ func (f *fakeClient) PublishMsg(msg *natsgo.Msg) error {
 	return nil
 }
 
-func (f *fakeClient) FlushWithContext(context.Context) error {
+// FlushWithContext refuses a context without a deadline, as nats.go does.
+func (f *fakeClient) FlushWithContext(ctx context.Context) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return natsgo.ErrNoDeadlineContext
+	}
 	f.flushes++
+	f.deadline = deadline
 	return nil
 }
 
@@ -70,5 +78,31 @@ func TestPublishReturnsTransportError(t *testing.T) {
 	err := New(&fakeClient{pubErr: want}).Publish(context.Background(), []outbox.Message{{Topic: "t"}})
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+// The relay's Publish context has no deadline; the flush brings its own.
+func TestPublishFlushTimeout(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want time.Duration
+	}{
+		{name: "default as nats.go Flush", want: defaultFlushTimeout},
+		{name: "configured", opts: []Option{WithFlushTimeout(time.Second)}, want: time.Second},
+		{name: "non-positive keeps the default", opts: []Option{WithFlushTimeout(0)}, want: defaultFlushTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			client := &fakeClient{}
+			before := time.Now()
+			if err := New(client, tc.opts...).Publish(context.Background(), []outbox.Message{{Topic: "t"}}); err != nil {
+				t.Fatalf("Publish: %v", err)
+			}
+			if left := client.deadline.Sub(before); left < tc.want || left > tc.want+time.Second {
+				t.Fatalf("flush deadline in %v, want %v", left, tc.want)
+			}
+		})
 	}
 }

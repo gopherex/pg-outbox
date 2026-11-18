@@ -354,6 +354,11 @@ func WithClearPayloadOnComplete(enabled bool) Option {
 	return func(s *Settings) { s.ClearPayloadOnComplete = enabled }
 }
 
-// WithPublishTimeout limits each Publish call. Zero disables the timeout.
-// Publishers must honor the supplied context; a timeout cannot undo a side effect.
+// WithPublishTimeout is the publish budget of each message: the context
+// outbox.MessageContext returns for a message ends d after the publisher
+// first asks for it, so one slow message never eats the budget of the ones
+// sent after it. The Publish call itself has no deadline; a publisher that
+// sends a batch in one transport call bounds it with its transport timeout.
+// Zero disables the timeout. Publishers must honor the supplied context; a
+// timeout cannot undo a side effect.
 func WithPublishTimeout(d time.Duration) Option { return func(s *Settings) { s.PublishTimeout = d } }

@@ -74,13 +74,10 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 	ends := make(map[string]func(port.Outcome), len(msgs))
 	defer func() { endDeliveries(msgs, ends, rec, err) }()
 
+	// The call has no deadline of its own: PublishTimeout is each message's
+	// budget (port.MessageContext), and the heartbeat keeps the leases.
 	pubCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if r.set.PublishTimeout > 0 {
-		var timeoutCancel context.CancelFunc
-		pubCtx, timeoutCancel = context.WithTimeout(pubCtx, r.set.PublishTimeout)
-		defer timeoutCancel()
-	}
 	// Early outcomes (port.Settle) commit while the batch is still publishing.
 	// Closed before the deliveries end (defers run in reverse), since those
 	// read what it recorded.
@@ -98,7 +95,9 @@ func (r *Relay) processBatch(ctx context.Context) (n int, err error) {
 		out[i] = withDeliveryHeaders(byID[m.ID], m, r.set.Instrumentation)
 	}
 
-	perr, leaseErr := r.publish(port.WithMessageContexts(pubCtx, byID), cancel, st, out)
+	msgCtx, release := port.WithMessageTimeouts(pubCtx, byID, r.set.PublishTimeout)
+	perr, leaseErr := r.publish(msgCtx, cancel, st, out)
+	release()
 	st.close()
 	earlyFatal, earlyErr := st.result()
 	if perr != nil && isFatal(ctx, r.set, perr) {
@@ -276,7 +275,7 @@ func (r *Relay) complete(ctx context.Context, msgs []message.Message, status mes
 // publisher context (through cancel); they are not converted to transport
 // failures. The lease then expires for recovery. An adapter ignoring
 // cancellation cannot be stopped safely by the library, but its stale result
-// cannot change a newer claim. pubCtx already carries the publish deadline.
+// cannot change a newer claim. pubCtx carries each message's budget.
 // st renews the leases of the rows still in flight (claim identity stays
 // private to it); out is what the adapter receives (a copy it may modify).
 func (r *Relay) publish(pubCtx context.Context, cancel context.CancelFunc, st *settler, out []message.Message) (error, error) {

@@ -170,7 +170,11 @@ func TestDeliveryControls(t *testing.T) {
 	})
 
 	t.Run("timeout is an ordinary failed attempt", func(t *testing.T) {
-		ob, _ := relay(t, pool, publisherFunc(func(ctx context.Context, _ []outbox.Message) error { <-ctx.Done(); return ctx.Err() }), outbox.WithPublishTimeout(50*time.Millisecond), outbox.WithMaxAttempts(1))
+		ob, _ := relay(t, pool, publisherFunc(func(ctx context.Context, ms []outbox.Message) error {
+			mctx := outbox.MessageContext(ctx, ms[0])
+			<-mctx.Done()
+			return mctx.Err()
+		}), outbox.WithPublishTimeout(50*time.Millisecond), outbox.WithMaxAttempts(1))
 		enqueue(t, ob, "timeout")
 		waitStatus(t, pool, "timeout", "dead")
 	})
@@ -752,4 +756,57 @@ func TestCleanupSkipsTransactionalReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitStatus(t, pool, "replay-lock", "pending")
+}
+
+// komeet's hot-feed case: a publisher sending one claimed batch row by row
+// gives every row its own WithPublishTimeout budget. The head row times out
+// on its own attempt; the tail, which as a whole takes longer than one
+// budget, publishes on the first attempt instead of failing on the time the
+// head took.
+func TestPublishTimeoutIsPerMessage(t *testing.T) {
+	pool := newTestPool(t)
+	const budget, step, tail = 300 * time.Millisecond, 100 * time.Millisecond, 5
+	head := uid(1)
+	rows := [][2]string{{head, "head"}}
+	for i := range tail {
+		rows = append(rows, [2]string{uid(2 + i), fmt.Sprintf("tail-%d", i)})
+	}
+	seedKeyed(t, pool, rows...)
+
+	pub := publisherFunc(func(ctx context.Context, ms []outbox.Message) error {
+		for _, m := range ms {
+			mctx := outbox.MessageContext(ctx, m)
+			wait := step
+			if m.ID == head {
+				wait = time.Hour
+			}
+			var outcome error
+			select {
+			case <-mctx.Done():
+				outcome = mctx.Err()
+			case <-time.After(wait):
+			}
+			if err := outbox.Settle(ctx, m, outcome); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	_, stop := relay(t, pool, pub, outbox.WithBatchSize(len(rows)), outbox.WithPublishTimeout(budget), outbox.WithMaxAttempts(1))
+	waitFor(t, 10*time.Second, func() bool {
+		var open int
+		err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM outbox_messages WHERE status NOT IN ('published', 'dead')`).Scan(&open)
+		return err == nil && open == 0
+	})
+	stop()
+
+	if status, attempts := rowState(t, pool, head); status != "dead" || attempts != 1 {
+		t.Fatalf("head = %s after %d attempts, want dead after its own timeout", status, attempts)
+	}
+	for _, row := range rows[1:] {
+		if status, attempts := rowState(t, pool, row[0]); status != "published" || attempts != 1 {
+			t.Fatalf("%s = %s after %d attempts, want published on the first", row[1], status, attempts)
+		}
+	}
 }

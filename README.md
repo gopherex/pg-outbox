@@ -68,9 +68,14 @@ ob, err := outbox.New(pool, enq, pub)
 
 Available publisher contrib modules:
 
-- `github.com/gopherex/pg-outbox/contrib/publishers/nats`
-- `github.com/gopherex/pg-outbox/contrib/publishers/kafka`
-- `github.com/gopherex/pg-outbox/contrib/publishers/valkey`
+- `github.com/gopherex/pg-outbox/contrib/publishers/nats`: queues the batch
+  and flushes it once, bounded by `outboxnats.WithFlushTimeout` (default 10s,
+  as nats.go's `Conn.Flush`).
+- `github.com/gopherex/pg-outbox/contrib/publishers/kafka`: one
+  `WriteMessages` call per batch, bounded by the kafka-go writer's
+  `WriteTimeout`.
+- `github.com/gopherex/pg-outbox/contrib/publishers/valkey`: one command per
+  message, each with its own `WithPublishTimeout` budget.
 
 Or implement `outbox.Publisher` for your own transport:
 
@@ -255,9 +260,14 @@ error logger; stale completions do not emit outcome hooks.
 
 While Publish runs, the relay renews the batch every third of LeaseDuration.
 A renewal failure cancels the publisher context and leaves recovery to lease
-expiry. Publishers must honor cancellation and configure transport timeouts;
-`WithPublishTimeout` optionally bounds the context for each Publish call
-(disabled by default). Cancellation cannot undo an external side effect, and
+expiry. Publishers must honor cancellation and configure transport timeouts.
+`WithPublishTimeout` optionally gives each message its own publish budget
+(disabled by default): the context `outbox.MessageContext(ctx, m)` returns
+ends that long after the publisher first asks for it, so a publisher sending
+rows one by one or through a bounded pool never fails a row on the time a
+slow neighbour took, and a row that times out is retried on its own attempt.
+The Publish call itself has no deadline; a publisher sending the whole batch
+in one transport call bounds it with its transport timeout. Cancellation cannot undo an external side effect, and
 an adapter that ignores context cannot be forcibly stopped. Delivery remains
 at-least-once, including when publication succeeds but recording it fails.
 
@@ -324,9 +334,11 @@ type Instrumentation interface {
   (stored in the row, sent to the transport); the caller's own entries win and
   the caller's map is never written.
 - `Deliver` runs in the relay for every claimed message before `Publish`. The
-  context it returns is derived from the publish context (deadline and
-  cancellation apply); a Publisher that sends messages one by one gets it with
-  `outbox.MessageContext(ctx, m)`. The built-in Valkey publishers do.
+  context it returns is derived from the publish context (cancellation
+  applies); a Publisher that sends messages one by one gets it with
+  `outbox.MessageContext(ctx, m)` right when it starts sending the message,
+  which also starts that message's `WithPublishTimeout` budget. The built-in
+  Valkey publishers do.
 - The messages handed to `Publish` also carry `Capture` of their delivery
   context in `Headers` (over the stored entries; the row is not changed), so
   every publisher that maps `Message.Headers` to the transport — NATS headers,
