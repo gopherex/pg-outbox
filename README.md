@@ -27,6 +27,26 @@ for _, stmt := range outbox.Migrations() {
 To install into a non-default schema, set `search_path` on the migration
 connection; then pass the same schema to `WithSchema`.
 
+### Declarative planning with ratel
+
+Stage the module's `schema.sql` as a desired-state input from the version pinned
+in the service's `go.mod`. From the service module (with `ratel.yaml` at its root):
+
+```sh
+go mod download github.com/gopherex/pg-outbox
+outbox_module=$(go list -m -f '{{.Dir}}' github.com/gopherex/pg-outbox)
+mkdir -p schema
+cp "$outbox_module/schema.sql" schema/pg-outbox.sql
+```
+
+Include `schema/pg-outbox.sql` in `ratel.yaml`'s `schema:` list (or a glob
+that already covers it). Run `ratel migrate plan <name>` and
+`ratel migrate verify`, then apply the service's own migration history. The
+unqualified objects land in `public` with ratel's default schema. Don't
+apply the legacy migrations as a second history, and don't execute the
+fragment as an upgrade script. The fragment describes the current schema;
+it does not run the historical data backfill in `migrations/`.
+
 ## Use
 
 ```go

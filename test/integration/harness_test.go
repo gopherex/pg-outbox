@@ -17,6 +17,12 @@ import (
 // returns a connected pool. The container is terminated via t.Cleanup.
 func newTestPool(t testing.TB) *pgxpool.Pool {
 	t.Helper()
+	pool, _ := newTestDatabase(t)
+	return pool
+}
+
+func newTestDatabase(t testing.TB) (*pgxpool.Pool, *postgres.PostgresContainer) {
+	t.Helper()
 	ctx := context.Background()
 	ctr, err := postgres.Run(ctx, "postgres:16-alpine",
 		postgres.WithDatabase("outbox"),
@@ -46,7 +52,7 @@ func newTestPool(t testing.TB) *pgxpool.Pool {
 			t.Fatalf("migrate: %v", err)
 		}
 	}
-	return pool
+	return pool, ctr
 }
 
 // capturePublisher records every delivered message; it can be told to fail the
